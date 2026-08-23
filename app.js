@@ -80,6 +80,9 @@ async function fetchOsmData(bounds) {
       way["natural"="water"](${bbox});
       way["waterway"="riverbank"](${bbox});
       way["landuse"="reservoir"](${bbox});
+      relation["natural"="water"](${bbox});
+      relation["waterway"="riverbank"](${bbox});
+      relation["landuse"="reservoir"](${bbox});
     );
     out geom;
   `;
@@ -547,8 +550,27 @@ function buildScene(osmData, bounds) {
   const roadNameBest = new Map(); // name -> { length, x, z, angleDeg }
 
   for (const el of osmData.elements) {
-    if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue;
     const tags = el.tags || {};
+
+    // мультиполигоны (крупные реки/водоёмы почти всегда так замаплены в OSM) —
+    // берём геометрию outer-колец из members; inner (острова) для простоты
+    // не вычитаем — это не критично для 3D-визуализации
+    if (el.type === 'relation') {
+      if (isWaterWay(tags) && Array.isArray(el.members)) {
+        for (const member of el.members) {
+          if (member.role === 'inner') continue;
+          if (member.type !== 'way' || !Array.isArray(member.geometry) || member.geometry.length < 2) continue;
+          const mpts = member.geometry
+            .filter(g => g && typeof g.lat === 'number' && typeof g.lon === 'number')
+            .map(g => project(g.lat, g.lon));
+          const mesh = flatPolygonMesh(mpts, WATER_Y, waterMat);
+          if (mesh) { scene.add(mesh); waterBuilt++; } else { skipped++; }
+        }
+      }
+      continue;
+    }
+
+    if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue;
     const pts = el.geometry
       .filter(g => g && typeof g.lat === 'number' && typeof g.lon === 'number')
       .map(g => project(g.lat, g.lon));
@@ -743,10 +765,12 @@ function addLabelsToSvg(svgEl, w, h) {
 function exportSvg() {
   const w = viewportEl.clientWidth, h = viewportEl.clientHeight;
   const svgRenderer = new SVGRenderer();
-  // overdraw закрывает тонкие швы между независимо отрисованными
-  // треугольниками (иначе на стыках граней в векторном экспорте
-  // остаются волосяные щели/иглы — особенно заметно в Illustrator)
-  svgRenderer.overdraw = 1.3;
+  // overdraw расширяет каждый треугольник независимо вдоль его нормали —
+  // на плоских стыках это скрывает волосяные щели, но на рёбрах здания,
+  // где грани сходятся под углом, даёт заметные «шипы» на углах.
+  // Вершины стен/крыш/дорог уже склеены через mergeVertices (общее ребро —
+  // это буквально одни и те же координаты), поэтому щелей нет и без него.
+  svgRenderer.overdraw = 0;
   svgRenderer.setSize(w, h);
   svgRenderer.render(scene, camera);
 
