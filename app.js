@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SVGRenderer } from 'three/addons/renderers/SVGRenderer.js';
+import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 
 /* ---------------------------------------------------------------------- */
 /*  Карта Leaflet + выделение прямоугольного участка                      */
@@ -80,14 +81,17 @@ async function fetchOsmData(bounds) {
 
 /* ---------------------------------------------------------------------- */
 /*  Проекция координат в локальные метры                                  */
+/*  Система координат: X = восток, Y = высота (вверх), Z = юг.            */
+/*  Это правая (right-handed) тройка, эквивалентная повороту ENU —        */
+/*  никакого отражения формы контуров она не создаёт.                     */
 /* ---------------------------------------------------------------------- */
 
 function makeProjector(centerLat, centerLon) {
   const R = 6378137;
   const cosLat = Math.cos(centerLat * Math.PI / 180);
   return function project(lat, lon) {
-    const x = (lon - centerLon) * Math.PI / 180 * R * cosLat;
-    const z = -(lat - centerLat) * Math.PI / 180 * R;
+    const x = (lon - centerLon) * Math.PI / 180 * R * cosLat; // восток = +X
+    const z = -(lat - centerLat) * Math.PI / 180 * R;         // юг = +Z, север = -Z
     return { x, z };
   };
 }
@@ -119,11 +123,10 @@ function roadWidth(tags) {
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Ручная экструзия здания (без rotation-трюков — height строго вдоль Y) */
+/*  Ручная экструзия здания (высота строго вдоль Y, без поворотов меша)   */
 /* ---------------------------------------------------------------------- */
 
 function buildingMesh(pts, height, wallMat, roofMat) {
-  // убираем повторяющуюся замыкающую точку кольца
   let ring = pts.slice();
   if (ring.length > 1) {
     const first = ring[0], last = ring[ring.length - 1];
@@ -132,14 +135,6 @@ function buildingMesh(pts, height, wallMat, roofMat) {
     }
   }
   if (ring.length < 3) return null;
-
-  // приводим обход к единому направлению (против часовой стрелки при виде сверху)
-  let area = 0;
-  for (let i = 0; i < ring.length; i++) {
-    const a = ring[i], b = ring[(i + 1) % ring.length];
-    area += a.x * b.z - b.x * a.z;
-  }
-  if (area < 0) ring.reverse();
 
   const group = new THREE.Group();
 
@@ -189,9 +184,10 @@ function ringCentroid(ring) {
 /*  Сцена Three.js                                                        */
 /* ---------------------------------------------------------------------- */
 
-let scene, camera, renderer, controls, viewportEl;
-let buildingLabels = []; // { text, x, y(height), z }
-let roadLabels = [];     // { text, x, z, angleDeg }
+let scene, camera, renderer, controls, css2dRenderer, viewportEl;
+let buildingLabels = []; // { text, x, y(height), z } — для SVG-экспорта
+let roadLabels = [];     // { text, x, z, angleDeg }  — для SVG-экспорта
+let cssLabelObjects = []; // CSS2DObject — живые подписи в 3D-сцене
 
 function initThree() {
   viewportEl = document.getElementById('viewport');
@@ -204,6 +200,13 @@ function initThree() {
   renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
   viewportEl.appendChild(renderer.domElement);
+
+  css2dRenderer = new CSS2DRenderer();
+  css2dRenderer.domElement.style.position = 'absolute';
+  css2dRenderer.domElement.style.top = '0';
+  css2dRenderer.domElement.style.left = '0';
+  css2dRenderer.domElement.style.pointerEvents = 'none';
+  viewportEl.appendChild(css2dRenderer.domElement);
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
@@ -219,15 +222,23 @@ function onResize() {
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   renderer.setSize(w, h);
+  css2dRenderer.setSize(w, h);
 }
 
 function animate() {
   requestAnimationFrame(animate);
   if (controls) controls.update();
-  if (renderer && scene && camera) renderer.render(scene, camera);
+  if (renderer && scene && camera) {
+    renderer.render(scene, camera);
+    css2dRenderer.render(scene, camera);
+  }
 }
 
 function clearScene() {
+  for (const obj of cssLabelObjects) {
+    if (obj.element && obj.element.parentNode) obj.element.parentNode.removeChild(obj.element);
+  }
+  cssLabelObjects = [];
   while (scene.children.length) {
     const obj = scene.children[0];
     scene.remove(obj);
@@ -236,6 +247,16 @@ function clearScene() {
       if (o.material) o.material.dispose();
     });
   }
+}
+
+function addCssLabel(text, x, y, z, className) {
+  const div = document.createElement('div');
+  div.className = className;
+  div.textContent = text;
+  const obj = new CSS2DObject(div);
+  obj.position.set(x, y, z);
+  scene.add(obj);
+  cssLabelObjects.push(obj);
 }
 
 function buildScene(osmData, bounds) {
@@ -262,7 +283,7 @@ function buildScene(osmData, bounds) {
   // свет
   scene.add(new THREE.AmbientLight(0xffffff, 0.6));
   const sun = new THREE.DirectionalLight(0xffffff, 0.8);
-  sun.position.set(span * 0.4, span * 0.8, span * 0.3);
+  sun.position.set(span * 0.3, span * 0.9, span * 0.6);
   scene.add(sun);
 
   const wallMat = new THREE.MeshLambertMaterial({ color: 0xc9b79c, side: THREE.DoubleSide });
@@ -272,7 +293,7 @@ function buildScene(osmData, bounds) {
   let buildingsBuilt = 0, roadsBuilt = 0, skipped = 0;
 
   // для дорог с одинаковым названием подписываем только самый длинный сегмент —
-  // иначе название улицы будет продублировано десятки раз
+  // иначе название улицы дублировалось бы десятки раз
   const roadNameBest = new Map(); // name -> { length, x, z, angleDeg }
 
   for (const el of osmData.elements) {
@@ -292,6 +313,7 @@ function buildScene(osmData, bounds) {
         if (num) {
           const c = ringCentroid(pts);
           buildingLabels.push({ text: num, x: c.x, y: height + 0.3, z: c.z });
+          addCssLabel(num, c.x, height + 0.3, c.z, 'label-housenum');
         }
       } else {
         skipped++;
@@ -307,7 +329,6 @@ function buildScene(osmData, bounds) {
       }
       const name = el.tags.name;
       if (name) {
-        // ищем самый длинный прямой сегмент этого way
         for (let i = 0; i < pts.length - 1; i++) {
           const a = pts[i], b = pts[i + 1];
           const dx = b.x - a.x, dz = b.z - a.z;
@@ -315,13 +336,8 @@ function buildScene(osmData, bounds) {
           if (len < 1e-6) continue;
           const prev = roadNameBest.get(name);
           if (!prev || len > prev.length) {
-            let angleDeg = Math.atan2(dz, dx) * 180 / Math.PI;
-            roadNameBest.set(name, {
-              length: len,
-              x: (a.x + b.x) / 2,
-              z: (a.z + b.z) / 2,
-              angleDeg
-            });
+            const angleDeg = Math.atan2(dz, dx) * 180 / Math.PI;
+            roadNameBest.set(name, { length: len, x: (a.x + b.x) / 2, z: (a.z + b.z) / 2, angleDeg });
           }
         }
       }
@@ -330,11 +346,14 @@ function buildScene(osmData, bounds) {
 
   for (const [name, info] of roadNameBest) {
     roadLabels.push({ text: name, x: info.x, z: info.z, angleDeg: info.angleDeg });
+    addCssLabel(name, info.x, 0.6, info.z, 'label-street');
   }
 
-  // стартовая позиция камеры — вид сверху-сбоку под углом
+  // Камера по умолчанию: с юга и сверху, глядя на север (как обычно
+  // ориентирована карта — север вверху, восток справа), а не по диагонали
+  // из угла — так вид не выглядит "перевёрнутым" относительно плоской карты.
   const dist = span * 0.9 + 20;
-  camera.position.set(dist * 0.6, dist * 0.6, dist * 0.6);
+  camera.position.set(dist * 0.2, dist * 0.85, dist * 0.8);
   controls.target.set(0, 0, 0);
   controls.update();
 
@@ -439,19 +458,16 @@ function addLabelsToSvg(svgEl, w, h) {
   camera.updateMatrixWorld();
   const margin = 40;
 
-  // номера домов
   for (const b of buildingLabels) {
     const p = project2D(b.x, b.y, b.z, w, h);
     if (!p.visible || p.x < -margin || p.x > w + margin || p.y < -margin || p.y > h + margin) continue;
     svgEl.appendChild(svgTextNode(b.text, p.x, p.y, { fontSize: 10, fill: '#2b2b2b', stroke: '#ffffff', strokeWidth: 2 }));
   }
 
-  // названия улиц
   for (const r of roadLabels) {
     const p = project2D(r.x, 0.3, r.z, w, h);
     if (!p.visible || p.x < -margin || p.x > w + margin || p.y < -margin || p.y > h + margin) continue;
 
-    // угол текста в экранных координатах, приблизительно по направлению дороги
     const p2 = project2D(
       r.x + Math.cos(r.angleDeg * Math.PI / 180) * 5,
       0.3,

@@ -72,3 +72,24 @@ button:hover:not(:disabled) { opacity: .85; }
 #map, #viewport { position: absolute; inset: 0; }
 #viewport { display: none; background: #cfe8ff; }
 #viewport canvas { display: block; }
+
+.label-housenum {
+  font-family: Arial, sans-serif;
+  font-size: 10px;
+  color: #2b2b2b;
+  background: rgba(255, 255, 255, 0.75);
+  padding: 0 3px;
+  border-radius: 2px;
+  white-space: nowrap;
+  transform: translate(-50%, -100%);
+}
+
+.label-street {
+  font-family: Arial, sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+  color: #1c2b3a;
+  text-shadow: 0 0 3px #fff, 0 0 3px #fff, 0 0 3px #fff;
+  white-space: nowrap;
+  transform: translate(-50%, -50%);
+}
