@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { SVGRenderer } from 'three/addons/renderers/SVGRenderer.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
+import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 
 /* ---------------------------------------------------------------------- */
 /*  Карта Leaflet + выделение прямоугольного участка                      */
@@ -60,6 +61,9 @@ function distanceMeters(lat1, lon1, lat2, lon2) {
 
 /* ---------------------------------------------------------------------- */
 /*  Загрузка данных из Overpass API                                       */
+/*  Помимо building — берём объекты, которые в OSM обычно тегируются      */
+/*  БЕЗ building (только amenity/shop/office), иначе школы, магазины      */
+/*  и т.п. пропадают из выборки.                                          */
 /* ---------------------------------------------------------------------- */
 
 async function fetchOsmData(bounds) {
@@ -70,6 +74,12 @@ async function fetchOsmData(bounds) {
     (
       way["building"](${bbox});
       way["highway"](${bbox});
+      way["amenity"~"^(school|university|college|kindergarten|hospital|clinic|doctors|pharmacy|marketplace|place_of_worship|library|townhall)$"](${bbox});
+      way["shop"](${bbox});
+      way["office"](${bbox});
+      way["natural"="water"](${bbox});
+      way["waterway"="riverbank"](${bbox});
+      way["landuse"="reservoir"](${bbox});
     );
     out geom;
   `;
@@ -97,7 +107,7 @@ function makeProjector(centerLat, centerLon) {
 }
 
 /* ---------------------------------------------------------------------- */
-/*  Высота зданий и ширина дорог по тегам OSM                             */
+/*  Высота зданий, ширина дорог, вертикальные отступы слоёв                */
 /* ---------------------------------------------------------------------- */
 
 function buildingHeight(tags) {
@@ -122,9 +132,31 @@ function roadWidth(tags) {
   return ROAD_WIDTHS[tags.highway] || 4;
 }
 
+const GROUND_Y = 0;
+const WATER_Y = 0.05;
+const ROAD_Y = 0.18; // заметно выше земли, чтобы не было z-fighting
+
 /* ---------------------------------------------------------------------- */
-/*  Категории зданий (для фильтра «что рисовать/экспортировать»)          */
+/*  Классификация way: вода / здание (и его категория) / дорога            */
 /* ---------------------------------------------------------------------- */
+
+function isWaterWay(tags) {
+  return tags.natural === 'water' || tags.landuse === 'reservoir' || tags.waterway === 'riverbank';
+}
+
+const EDU_AMENITIES = ['school', 'university', 'college', 'kindergarten'];
+const HEALTH_AMENITIES = ['hospital', 'clinic', 'doctors', 'pharmacy'];
+const CIVIC_AMENITIES = ['place_of_worship', 'library', 'townhall', 'marketplace'];
+
+function isBuildingLikeWay(tags) {
+  if (tags.building) return true;
+  if (EDU_AMENITIES.includes(tags.amenity)) return true;
+  if (HEALTH_AMENITIES.includes(tags.amenity)) return true;
+  if (CIVIC_AMENITIES.includes(tags.amenity)) return true;
+  if (tags.shop) return true;
+  if (tags.office) return true;
+  return false;
+}
 
 const CATEGORY_MAP = {
   residential: ['residential', 'apartments', 'house', 'detached', 'terrace', 'dormitory', 'semidetached_house', 'bungalow', 'cabin', 'static_caravan'],
@@ -134,10 +166,18 @@ const CATEGORY_MAP = {
   industrial: ['industrial', 'warehouse', 'factory', 'manufacture', 'barn', 'farm_auxiliary'],
   civic: ['civic', 'government', 'public', 'church', 'cathedral', 'chapel', 'religious', 'museum', 'library', 'train_station', 'transportation']
 };
-function categorize(buildingValue) {
-  if (!buildingValue) return 'other';
-  for (const [cat, list] of Object.entries(CATEGORY_MAP)) {
-    if (list.includes(buildingValue)) return cat;
+
+function categorize(tags) {
+  if (!tags) return 'other';
+  if (EDU_AMENITIES.includes(tags.amenity)) return 'education';
+  if (HEALTH_AMENITIES.includes(tags.amenity)) return 'healthcare';
+  if (tags.amenity === 'marketplace' || tags.shop || tags.office) return 'commercial';
+  if (['place_of_worship', 'library', 'townhall'].includes(tags.amenity)) return 'civic';
+  const b = tags.building;
+  if (b) {
+    for (const [cat, list] of Object.entries(CATEGORY_MAP)) {
+      if (list.includes(b)) return cat;
+    }
   }
   return 'other';
 }
@@ -151,17 +191,59 @@ document.querySelectorAll('.cat-toggle').forEach(cb => {
 });
 
 /* ---------------------------------------------------------------------- */
-/*  Ручная экструзия здания (высота строго вдоль Y, без поворотов меша)   */
+/*  Геометрия: контуры, крыши/вода (плоские полигоны), стены зданий        */
+/*                                                                          */
+/*  Важно для корректного SVG-экспорта: соседние точки контура,            */
+/*  «слипшиеся» из-за точности OSM-координат, дают вырожденные (почти      */
+/*  нулевой площади) треугольники — в растровом WebGL это незаметно, а в   */
+/*  SVGRenderer (рисует треугольники независимыми полигонами, без         */
+/*  z-buffer) превращается в длинные «иглы»/швы на стыках. Поэтому:        */
+/*   1) чистим контур от точек ближе 5 см друг к другу;                    */
+/*   2) склеиваем совпадающие вершины (mergeVertices) перед рендером.      */
 /* ---------------------------------------------------------------------- */
 
-function buildingMesh(pts, height, wallMat, roofMat) {
-  let ring = pts.slice();
-  if (ring.length > 1) {
-    const first = ring[0], last = ring[ring.length - 1];
-    if (Math.abs(first.x - last.x) < 1e-6 && Math.abs(first.z - last.z) < 1e-6) {
-      ring = ring.slice(0, ring.length - 1);
+function cleanRing(pts) {
+  const EPS = 0.05; // 5 см
+  const ring = [];
+  for (const p of pts) {
+    const last = ring[ring.length - 1];
+    if (!last || Math.hypot(p.x - last.x, p.z - last.z) > EPS) {
+      ring.push(p);
     }
   }
+  if (ring.length > 1) {
+    const first = ring[0], last = ring[ring.length - 1];
+    if (Math.hypot(first.x - last.x, first.z - last.z) <= EPS) ring.pop();
+  }
+  return ring;
+}
+
+function flatPolygonMesh(pts, y, mat) {
+  const ring = cleanRing(pts);
+  if (ring.length < 3) return null;
+  try {
+    const shapePts2D = ring.map(p => new THREE.Vector2(p.x, p.z));
+    const triangles = THREE.ShapeUtils.triangulateShape(shapePts2D, []);
+    const positions = [];
+    for (const tri of triangles) {
+      for (const idx of tri) {
+        const p = ring[idx];
+        positions.push(p.x, y, p.z);
+      }
+    }
+    if (positions.length === 0) return null;
+    let geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo = mergeVertices(geo, 1e-4);
+    geo.computeVertexNormals();
+    return new THREE.Mesh(geo, mat);
+  } catch (err) {
+    return null;
+  }
+}
+
+function buildingMesh(pts, height, wallMat, roofMat) {
+  const ring = cleanRing(pts);
   if (ring.length < 3) return null;
 
   const group = new THREE.Group();
@@ -172,30 +254,14 @@ function buildingMesh(pts, height, wallMat, roofMat) {
     wallPositions.push(a.x, 0, a.z,  b.x, 0, b.z,  b.x, height, b.z);
     wallPositions.push(a.x, 0, a.z,  b.x, height, b.z,  a.x, height, a.z);
   }
-  const wallGeo = new THREE.BufferGeometry();
+  let wallGeo = new THREE.BufferGeometry();
   wallGeo.setAttribute('position', new THREE.Float32BufferAttribute(wallPositions, 3));
+  wallGeo = mergeVertices(wallGeo, 1e-4);
   wallGeo.computeVertexNormals();
   group.add(new THREE.Mesh(wallGeo, wallMat));
 
-  try {
-    const shapePts2D = ring.map(p => new THREE.Vector2(p.x, p.z));
-    const triangles = THREE.ShapeUtils.triangulateShape(shapePts2D, []);
-    const roofPositions = [];
-    for (const tri of triangles) {
-      for (const idx of tri) {
-        const p = ring[idx];
-        roofPositions.push(p.x, height, p.z);
-      }
-    }
-    if (roofPositions.length > 0) {
-      const roofGeo = new THREE.BufferGeometry();
-      roofGeo.setAttribute('position', new THREE.Float32BufferAttribute(roofPositions, 3));
-      roofGeo.computeVertexNormals();
-      group.add(new THREE.Mesh(roofGeo, roofMat));
-    }
-  } catch (err) {
-    // если контур самопересекающийся — оставляем только стены
-  }
+  const roofMesh = flatPolygonMesh(ring, height, roofMat);
+  if (roofMesh) group.add(roofMesh);
 
   return group;
 }
@@ -211,7 +277,7 @@ function ringCentroid(ring) {
 /* ---------------------------------------------------------------------- */
 
 let scene, camera, perspCamera, orthoCamera, renderer, controls, css2dRenderer, viewportEl;
-let wallMat, roofMat, roadMat, groundMat;
+let wallMat, roofMat, roadMat, groundMat, waterMat;
 let buildingLabels = []; // { text, x, y(height), z } — для SVG-экспорта
 let roadLabels = [];     // { text, x, z, angleDeg }  — для SVG-экспорта
 let cssLabelObjects = []; // CSS2DObject — живые подписи в 3D-сцене
@@ -264,14 +330,15 @@ function initMaterials() {
   roofMat = new THREE.MeshLambertMaterial({ color: 0x9c8a70, side: THREE.DoubleSide });
   roadMat = new THREE.MeshBasicMaterial({ color: 0x555a5f, side: THREE.DoubleSide });
   groundMat = new THREE.MeshLambertMaterial({ color: 0xdfe6d8 });
+  waterMat = new THREE.MeshLambertMaterial({ color: 0x6fa8dc, side: THREE.DoubleSide });
 }
 
 function createControls() {
   if (controls) controls.dispose();
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enableDamping = true;
-  controls.maxPolarAngle = Math.PI / 2 * 0.995; // не даём камере уйти под землю
-  controls.minPolarAngle = 0.02;
+  controls.maxPolarAngle = Math.PI / 2 * 0.999; // не даём камере уйти под землю
+  controls.minPolarAngle = 0.01; // почти зенит — для вида «строго сверху»
   controls.addEventListener('change', onControlsChange);
 }
 
@@ -288,6 +355,8 @@ function updatePerspFov() {
   if (!perspCamera || !viewportEl) return;
   perspCamera.fov = fovFromFocal(camFocalMM);
   perspCamera.aspect = viewportEl.clientWidth / Math.max(viewportEl.clientHeight, 1);
+  perspCamera.near = Math.max(currentSpan * 0.002, 0.05);
+  perspCamera.far = Math.max(currentSpan * 15, 200);
   perspCamera.updateProjectionMatrix();
 }
 
@@ -300,8 +369,8 @@ function updateOrthoFrustum() {
   orthoCamera.right = halfHeight * aspect;
   orthoCamera.top = halfHeight;
   orthoCamera.bottom = -halfHeight;
-  orthoCamera.near = 0.1;
-  orthoCamera.far = 20000;
+  orthoCamera.near = Math.max(currentSpan * 0.002, 0.05);
+  orthoCamera.far = Math.max(currentSpan * 15, 200);
   orthoCamera.updateProjectionMatrix();
 }
 
@@ -370,12 +439,23 @@ document.getElementById('ortho-toggle').addEventListener('change', (e) => {
   updateReadout();
 });
 
+document.getElementById('btn-top-view').addEventListener('click', () => {
+  camAzimuth = 0;
+  camElevation = 89.4;
+  camOrtho = true;
+  document.getElementById('ortho-toggle').checked = true;
+  document.querySelectorAll('#focal-group .chip').forEach(b => b.classList.remove('active'));
+  if (!camera) { updateReadout(); return; }
+  switchCameraType(true);
+  updateReadout();
+});
+
 document.getElementById('btn-apply-camera').addEventListener('click', () => {
   const az = parseFloat(document.getElementById('cam-azimuth').value);
   const el = parseFloat(document.getElementById('cam-elevation').value);
   const dist = parseFloat(document.getElementById('cam-distance').value);
   if (!isNaN(az)) camAzimuth = az;
-  if (!isNaN(el)) camElevation = THREE.MathUtils.clamp(el, 1, 89);
+  if (!isNaN(el)) camElevation = THREE.MathUtils.clamp(el, 1, 89.5);
   if (!isNaN(dist) && dist > 0) camDistanceRatio = dist;
   if (!camera) { updateReadout(); return; }
   applyCameraSpherical();
@@ -383,12 +463,12 @@ document.getElementById('btn-apply-camera').addEventListener('click', () => {
 });
 
 /* --- UI цветов --- */
-// материалы (wallMat/roofMat/roadMat/groundMat) создаются в initThree();
-// до первого «Построить 3D» изменение цвета просто ничего не делает.
+
 document.getElementById('color-wall').addEventListener('input', e => { if (wallMat) wallMat.color.set(e.target.value); });
 document.getElementById('color-roof').addEventListener('input', e => { if (roofMat) roofMat.color.set(e.target.value); });
 document.getElementById('color-road').addEventListener('input', e => { if (roadMat) roadMat.color.set(e.target.value); });
 document.getElementById('color-ground').addEventListener('input', e => { if (groundMat) groundMat.color.set(e.target.value); });
+document.getElementById('color-water').addEventListener('input', e => { if (waterMat) waterMat.color.set(e.target.value); });
 
 function onResize() {
   if (!viewportEl || viewportEl.style.display === 'none') return;
@@ -454,6 +534,7 @@ function buildScene(osmData, bounds) {
   const groundGeo = new THREE.PlaneGeometry(sceneWidth * 1.05, sceneDepth * 1.05);
   const ground = new THREE.Mesh(groundGeo, groundMat);
   ground.rotation.x = -Math.PI / 2;
+  ground.position.y = GROUND_Y;
   scene.add(ground);
 
   // свет
@@ -462,43 +543,47 @@ function buildScene(osmData, bounds) {
   sun.position.set(currentSpan * 0.3, currentSpan * 0.9, currentSpan * 0.6);
   scene.add(sun);
 
-  let buildingsBuilt = 0, roadsBuilt = 0, skipped = 0;
+  let buildingsBuilt = 0, roadsBuilt = 0, waterBuilt = 0, skipped = 0;
   const roadNameBest = new Map(); // name -> { length, x, z, angleDeg }
 
   for (const el of osmData.elements) {
     if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue;
+    const tags = el.tags || {};
     const pts = el.geometry
       .filter(g => g && typeof g.lat === 'number' && typeof g.lon === 'number')
       .map(g => project(g.lat, g.lon));
 
-    if (el.tags && el.tags.building) {
-      const cat = categorize(el.tags.building);
+    if (isWaterWay(tags)) {
+      const mesh = flatPolygonMesh(pts, WATER_Y, waterMat);
+      if (mesh) { scene.add(mesh); waterBuilt++; } else { skipped++; }
+    } else if (isBuildingLikeWay(tags)) {
+      const cat = categorize(tags);
       if (!enabledCategories.has(cat)) { skipped++; continue; }
       if (pts.length < 3) { skipped++; continue; }
-      const height = buildingHeight(el.tags);
+      const height = buildingHeight(tags);
       const mesh = buildingMesh(pts, height, wallMat, roofMat);
       if (mesh) {
         scene.add(mesh);
         buildingsBuilt++;
-        const num = el.tags['addr:housenumber'];
+        const num = tags['addr:housenumber'];
         if (num) {
-          const c = ringCentroid(pts);
+          const c = ringCentroid(cleanRing(pts));
           buildingLabels.push({ text: num, x: c.x, y: height + 0.3, z: c.z });
           addCssLabel(num, c.x, height + 0.3, c.z, 'label-housenum');
         }
       } else {
         skipped++;
       }
-    } else if (el.tags && el.tags.highway) {
-      const width = roadWidth(el.tags);
+    } else if (tags.highway) {
+      const width = roadWidth(tags);
       const geo = roadStripGeometry(pts, width);
       if (geo) {
         const mesh = new THREE.Mesh(geo, roadMat);
-        mesh.position.y = 0.03;
+        mesh.position.y = ROAD_Y;
         scene.add(mesh);
         roadsBuilt++;
       }
-      const name = el.tags.name;
+      const name = tags.name;
       if (name) {
         for (let i = 0; i < pts.length - 1; i++) {
           const a = pts[i], b = pts[i + 1];
@@ -517,7 +602,7 @@ function buildScene(osmData, bounds) {
 
   for (const [name, info] of roadNameBest) {
     roadLabels.push({ text: name, x: info.x, z: info.z, angleDeg: info.angleDeg });
-    addCssLabel(name, info.x, 0.6, info.z, 'label-street');
+    addCssLabel(name, info.x, ROAD_Y + 0.4, info.z, 'label-street');
   }
 
   // применяем текущий (сохранённый) ракурс камеры к новой сцене —
@@ -526,7 +611,7 @@ function buildScene(osmData, bounds) {
   applyCameraSpherical();
   updateReadout();
 
-  setStatus(`Готово. Зданий: ${buildingsBuilt}, дорог: ${roadsBuilt}` + (skipped ? `, пропущено: ${skipped}` : ''));
+  setStatus(`Готово. Зданий: ${buildingsBuilt}, дорог: ${roadsBuilt}, водоёмов: ${waterBuilt}` + (skipped ? `, пропущено: ${skipped}` : ''));
 }
 
 function roadStripGeometry(pts, width) {
@@ -545,8 +630,9 @@ function roadStripGeometry(pts, width) {
     positions.push(a2.x, 0, a2.z, b2.x, 0, b2.z, b1.x, 0, b1.z);
   }
   if (positions.length === 0) return null;
-  const geo = new THREE.BufferGeometry();
+  let geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo = mergeVertices(geo, 1e-4);
   geo.computeVertexNormals();
   return geo;
 }
@@ -634,12 +720,12 @@ function addLabelsToSvg(svgEl, w, h) {
   }
 
   for (const r of roadLabels) {
-    const p = project2D(r.x, 0.3, r.z, w, h);
+    const p = project2D(r.x, ROAD_Y, r.z, w, h);
     if (!p.visible || p.x < -margin || p.x > w + margin || p.y < -margin || p.y > h + margin) continue;
 
     const p2 = project2D(
       r.x + Math.cos(r.angleDeg * Math.PI / 180) * 5,
-      0.3,
+      ROAD_Y,
       r.z + Math.sin(r.angleDeg * Math.PI / 180) * 5,
       w, h
     );
@@ -657,6 +743,10 @@ function addLabelsToSvg(svgEl, w, h) {
 function exportSvg() {
   const w = viewportEl.clientWidth, h = viewportEl.clientHeight;
   const svgRenderer = new SVGRenderer();
+  // overdraw закрывает тонкие швы между независимо отрисованными
+  // треугольниками (иначе на стыках граней в векторном экспорте
+  // остаются волосяные щели/иглы — особенно заметно в Illustrator)
+  svgRenderer.overdraw = 1.3;
   svgRenderer.setSize(w, h);
   svgRenderer.render(scene, camera);
 

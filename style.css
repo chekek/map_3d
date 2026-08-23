@@ -147,6 +147,17 @@ button:hover:not(:disabled) { opacity: .85; }
   margin-bottom: 8px;
 }
 
+.secondary-btn {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin-bottom: 12px;
+  background: #232b33;
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.secondary-btn:hover { border-color: var(--accent); opacity: 1; }
+
 .readout {
   font-size: 11px;
   color: var(--accent);
