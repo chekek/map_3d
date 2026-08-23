@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OSM → 3D участок</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+  <aside id="panel">
+    <h1>OSM → 3D</h1>
+    <ol class="steps">
+      <li>Найдите нужное место на карте</li>
+      <li>Нажмите «Выделить участок» и нарисуйте прямоугольник</li>
+      <li>Нажмите «Построить 3D»</li>
+      <li>Крутите/двигайте камеру мышью — выберите ракурс</li>
+      <li>Нажмите «Сохранить SVG»</li>
+    </ol>
+
+    <div class="btn-group">
+      <button id="btn-draw">Выделить участок</button>
+      <button id="btn-generate" disabled>Построить 3D</button>
+      <button id="btn-back" disabled>Назад к карте</button>
+      <button id="btn-export" disabled>Сохранить SVG</button>
+    </div>
+
+    <div id="status"></div>
+
+    <details class="hint">
+      <summary>Советы</summary>
+      <p>Выбирайте небольшой участок (примерно до 600×600 м) — иначе Overpass API вернёт слишком много данных, и генерация будет долгой или вовсе не сработает.</p>
+      <p>Высота зданий берётся из тегов OSM <code>height</code> или <code>building:levels</code> (× 3 м). Если тегов нет — используется значение по умолчанию (6 м).</p>
+      <p>Ширина дорог оценивается по типу <code>highway</code> (магистраль шире, тропинка уже).</p>
+    </details>
+  </aside>
+
+  <main id="stage">
+    <div id="map"></div>
+    <div id="viewport"></div>
+  </main>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+<script type="module" src="app.js"></script>
+</body>
+</html>
