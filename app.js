@@ -119,10 +119,79 @@ function roadWidth(tags) {
 }
 
 /* ---------------------------------------------------------------------- */
+/*  Ручная экструзия здания (без rotation-трюков — height строго вдоль Y) */
+/* ---------------------------------------------------------------------- */
+
+function buildingMesh(pts, height, wallMat, roofMat) {
+  // убираем повторяющуюся замыкающую точку кольца
+  let ring = pts.slice();
+  if (ring.length > 1) {
+    const first = ring[0], last = ring[ring.length - 1];
+    if (Math.abs(first.x - last.x) < 1e-6 && Math.abs(first.z - last.z) < 1e-6) {
+      ring = ring.slice(0, ring.length - 1);
+    }
+  }
+  if (ring.length < 3) return null;
+
+  // приводим обход к единому направлению (против часовой стрелки при виде сверху)
+  let area = 0;
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    area += a.x * b.z - b.x * a.z;
+  }
+  if (area < 0) ring.reverse();
+
+  const group = new THREE.Group();
+
+  // стены: каждое ребро контура -> вертикальный квад от y=0 до y=height
+  const wallPositions = [];
+  for (let i = 0; i < ring.length; i++) {
+    const a = ring[i], b = ring[(i + 1) % ring.length];
+    wallPositions.push(a.x, 0, a.z,  b.x, 0, b.z,  b.x, height, b.z);
+    wallPositions.push(a.x, 0, a.z,  b.x, height, b.z,  a.x, height, a.z);
+  }
+  const wallGeo = new THREE.BufferGeometry();
+  wallGeo.setAttribute('position', new THREE.Float32BufferAttribute(wallPositions, 3));
+  wallGeo.computeVertexNormals();
+  group.add(new THREE.Mesh(wallGeo, wallMat));
+
+  // крыша: триангуляция контура в плане, все вершины на y=height
+  try {
+    const shapePts2D = ring.map(p => new THREE.Vector2(p.x, p.z));
+    const triangles = THREE.ShapeUtils.triangulateShape(shapePts2D, []);
+    const roofPositions = [];
+    for (const tri of triangles) {
+      for (const idx of tri) {
+        const p = ring[idx];
+        roofPositions.push(p.x, height, p.z);
+      }
+    }
+    if (roofPositions.length > 0) {
+      const roofGeo = new THREE.BufferGeometry();
+      roofGeo.setAttribute('position', new THREE.Float32BufferAttribute(roofPositions, 3));
+      roofGeo.computeVertexNormals();
+      group.add(new THREE.Mesh(roofGeo, roofMat));
+    }
+  } catch (err) {
+    // если контур самопересекающийся — оставляем только стены
+  }
+
+  return group;
+}
+
+function ringCentroid(ring) {
+  let sx = 0, sz = 0;
+  for (const p of ring) { sx += p.x; sz += p.z; }
+  return { x: sx / ring.length, z: sz / ring.length };
+}
+
+/* ---------------------------------------------------------------------- */
 /*  Сцена Three.js                                                        */
 /* ---------------------------------------------------------------------- */
 
 let scene, camera, renderer, controls, viewportEl;
+let buildingLabels = []; // { text, x, y(height), z }
+let roadLabels = [];     // { text, x, z, angleDeg }
 
 function initThree() {
   viewportEl = document.getElementById('viewport');
@@ -162,13 +231,17 @@ function clearScene() {
   while (scene.children.length) {
     const obj = scene.children[0];
     scene.remove(obj);
-    if (obj.geometry) obj.geometry.dispose();
-    if (obj.material) obj.material.dispose();
+    obj.traverse(o => {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
   }
 }
 
 function buildScene(osmData, bounds) {
   clearScene();
+  buildingLabels = [];
+  roadLabels = [];
 
   const center = bounds.getCenter();
   const project = makeProjector(center.lat, center.lng);
@@ -177,6 +250,7 @@ function buildScene(osmData, bounds) {
   const ne = project(bounds.getNorth(), bounds.getEast());
   const sceneWidth = Math.abs(ne.x - sw.x);
   const sceneDepth = Math.abs(sw.z - ne.z);
+  const span = Math.max(sceneWidth, sceneDepth, 10);
 
   // земля
   const groundGeo = new THREE.PlaneGeometry(sceneWidth * 1.05, sceneDepth * 1.05);
@@ -188,14 +262,18 @@ function buildScene(osmData, bounds) {
   // свет
   scene.add(new THREE.AmbientLight(0xffffff, 0.6));
   const sun = new THREE.DirectionalLight(0xffffff, 0.8);
-  const span = Math.max(sceneWidth, sceneDepth, 10);
   sun.position.set(span * 0.4, span * 0.8, span * 0.3);
   scene.add(sun);
 
-  const buildingMat = new THREE.MeshLambertMaterial({ color: 0xc9b79c });
+  const wallMat = new THREE.MeshLambertMaterial({ color: 0xc9b79c, side: THREE.DoubleSide });
+  const roofMat = new THREE.MeshLambertMaterial({ color: 0x9c8a70, side: THREE.DoubleSide });
   const roadMat = new THREE.MeshBasicMaterial({ color: 0x555a5f, side: THREE.DoubleSide });
 
   let buildingsBuilt = 0, roadsBuilt = 0, skipped = 0;
+
+  // для дорог с одинаковым названием подписываем только самый длинный сегмент —
+  // иначе название улицы будет продублировано десятки раз
+  const roadNameBest = new Map(); // name -> { length, x, z, angleDeg }
 
   for (const el of osmData.elements) {
     if (el.type !== 'way' || !el.geometry || el.geometry.length < 2) continue;
@@ -205,16 +283,17 @@ function buildScene(osmData, bounds) {
 
     if (el.tags && el.tags.building) {
       if (pts.length < 3) { skipped++; continue; }
-      try {
-        const shapePts = pts.map(p => new THREE.Vector2(p.x, p.z));
-        const shape = new THREE.Shape(shapePts);
-        const height = buildingHeight(el.tags);
-        const geo = new THREE.ExtrudeGeometry(shape, { depth: height, bevelEnabled: false, curveSegments: 1 });
-        const mesh = new THREE.Mesh(geo, buildingMat);
-        mesh.rotation.x = -Math.PI / 2;
+      const height = buildingHeight(el.tags);
+      const mesh = buildingMesh(pts, height, wallMat, roofMat);
+      if (mesh) {
         scene.add(mesh);
         buildingsBuilt++;
-      } catch (err) {
+        const num = el.tags['addr:housenumber'];
+        if (num) {
+          const c = ringCentroid(pts);
+          buildingLabels.push({ text: num, x: c.x, y: height + 0.3, z: c.z });
+        }
+      } else {
         skipped++;
       }
     } else if (el.tags && el.tags.highway) {
@@ -226,7 +305,31 @@ function buildScene(osmData, bounds) {
         scene.add(mesh);
         roadsBuilt++;
       }
+      const name = el.tags.name;
+      if (name) {
+        // ищем самый длинный прямой сегмент этого way
+        for (let i = 0; i < pts.length - 1; i++) {
+          const a = pts[i], b = pts[i + 1];
+          const dx = b.x - a.x, dz = b.z - a.z;
+          const len = Math.sqrt(dx * dx + dz * dz);
+          if (len < 1e-6) continue;
+          const prev = roadNameBest.get(name);
+          if (!prev || len > prev.length) {
+            let angleDeg = Math.atan2(dz, dx) * 180 / Math.PI;
+            roadNameBest.set(name, {
+              length: len,
+              x: (a.x + b.x) / 2,
+              z: (a.z + b.z) / 2,
+              angleDeg
+            });
+          }
+        }
+      }
     }
+  }
+
+  for (const [name, info] of roadNameBest) {
+    roadLabels.push({ text: name, x: info.x, z: info.z, angleDeg: info.angleDeg });
   }
 
   // стартовая позиция камеры — вид сверху-сбоку под углом
@@ -295,6 +398,77 @@ btnBack.addEventListener('click', () => {
 
 btnExport.addEventListener('click', exportSvg);
 
+/* ---------------------------------------------------------------------- */
+/*  Экспорт в SVG + подписи домов и улиц                                  */
+/* ---------------------------------------------------------------------- */
+
+function project2D(x, y, z, w, h) {
+  const v = new THREE.Vector3(x, y, z);
+  v.project(camera);
+  return {
+    x: (v.x * 0.5 + 0.5) * w,
+    y: (-v.y * 0.5 + 0.5) * h,
+    visible: v.z < 1
+  };
+}
+
+function svgTextNode(text, x, y, opts) {
+  const NS = 'http://www.w3.org/2000/svg';
+  const t = document.createElementNS(NS, 'text');
+  t.setAttribute('x', x.toFixed(1));
+  t.setAttribute('y', y.toFixed(1));
+  t.setAttribute('font-family', 'Arial, sans-serif');
+  t.setAttribute('font-size', String(opts.fontSize || 11));
+  t.setAttribute('fill', opts.fill || '#000000');
+  t.setAttribute('text-anchor', opts.anchor || 'middle');
+  if (opts.bold) t.setAttribute('font-weight', 'bold');
+  if (opts.stroke) {
+    t.setAttribute('stroke', opts.stroke);
+    t.setAttribute('stroke-width', String(opts.strokeWidth || 3));
+    t.setAttribute('paint-order', 'stroke');
+    t.setAttribute('stroke-linejoin', 'round');
+  }
+  if (opts.angle) {
+    t.setAttribute('transform', `rotate(${opts.angle.toFixed(1)} ${x.toFixed(1)} ${y.toFixed(1)})`);
+  }
+  t.textContent = text;
+  return t;
+}
+
+function addLabelsToSvg(svgEl, w, h) {
+  camera.updateMatrixWorld();
+  const margin = 40;
+
+  // номера домов
+  for (const b of buildingLabels) {
+    const p = project2D(b.x, b.y, b.z, w, h);
+    if (!p.visible || p.x < -margin || p.x > w + margin || p.y < -margin || p.y > h + margin) continue;
+    svgEl.appendChild(svgTextNode(b.text, p.x, p.y, { fontSize: 10, fill: '#2b2b2b', stroke: '#ffffff', strokeWidth: 2 }));
+  }
+
+  // названия улиц
+  for (const r of roadLabels) {
+    const p = project2D(r.x, 0.3, r.z, w, h);
+    if (!p.visible || p.x < -margin || p.x > w + margin || p.y < -margin || p.y > h + margin) continue;
+
+    // угол текста в экранных координатах, приблизительно по направлению дороги
+    const p2 = project2D(
+      r.x + Math.cos(r.angleDeg * Math.PI / 180) * 5,
+      0.3,
+      r.z + Math.sin(r.angleDeg * Math.PI / 180) * 5,
+      w, h
+    );
+    let screenAngle = Math.atan2(p2.y - p.y, p2.x - p.x) * 180 / Math.PI;
+    if (screenAngle > 90) screenAngle -= 180;
+    if (screenAngle < -90) screenAngle += 180;
+
+    svgEl.appendChild(svgTextNode(r.text, p.x, p.y, {
+      fontSize: 13, fill: '#1c2b3a', bold: true,
+      stroke: '#ffffff', strokeWidth: 3, angle: screenAngle
+    }));
+  }
+}
+
 function exportSvg() {
   const w = viewportEl.clientWidth, h = viewportEl.clientHeight;
   const svgRenderer = new SVGRenderer();
@@ -305,6 +479,8 @@ function exportSvg() {
   svgEl.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
   svgEl.setAttribute('width', String(w));
   svgEl.setAttribute('height', String(h));
+
+  addLabelsToSvg(svgEl, w, h);
 
   const serializer = new XMLSerializer();
   let svgString = serializer.serializeToString(svgEl);
@@ -320,5 +496,5 @@ function exportSvg() {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 
-  setStatus('SVG сохранён.');
+  setStatus('SVG сохранён (с подписями домов и улиц).');
 }
