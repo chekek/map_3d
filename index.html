@@ -29,6 +29,73 @@
 
     <div id="status"></div>
 
+    <details class="section" id="camera-section" open>
+      <summary>Камера</summary>
+
+      <div class="field-row">
+        <label>Объектив</label>
+        <div class="chip-group" id="focal-group">
+          <button type="button" class="chip" data-focal="18">18мм</button>
+          <button type="button" class="chip" data-focal="35">35мм</button>
+          <button type="button" class="chip active" data-focal="50">50мм</button>
+          <button type="button" class="chip" data-focal="250">250мм</button>
+        </div>
+      </div>
+
+      <label class="checkbox-row">
+        <input type="checkbox" id="ortho-toggle" />
+        Ортографическая проекция (без перспективы)
+      </label>
+
+      <div class="field-row">
+        <label for="cam-azimuth">Азимут, °</label>
+        <input type="number" id="cam-azimuth" step="1" />
+      </div>
+      <div class="field-row">
+        <label for="cam-elevation">Высота камеры, °</label>
+        <input type="number" id="cam-elevation" step="1" min="1" max="89" />
+      </div>
+      <div class="field-row">
+        <label for="cam-distance">Дистанция, ×</label>
+        <input type="number" id="cam-distance" step="0.1" min="0.3" />
+      </div>
+      <button id="btn-apply-camera">Применить ракурс</button>
+
+      <p class="readout" id="camera-readout">Ракурс появится после построения 3D.</p>
+      <p class="hint-text">Запишите эти числа — введите их же на другом участке, чтобы повторить точно такой же ракурс.</p>
+    </details>
+
+    <details class="section" id="colors-section">
+      <summary>Цвета</summary>
+      <div class="color-row">
+        <label for="color-wall">Стены зданий</label>
+        <input type="color" id="color-wall" value="#c9b79c" />
+      </div>
+      <div class="color-row">
+        <label for="color-roof">Крыши</label>
+        <input type="color" id="color-roof" value="#9c8a70" />
+      </div>
+      <div class="color-row">
+        <label for="color-road">Дороги</label>
+        <input type="color" id="color-road" value="#555a5f" />
+      </div>
+      <div class="color-row">
+        <label for="color-ground">Земля</label>
+        <input type="color" id="color-ground" value="#dfe6d8" />
+      </div>
+    </details>
+
+    <details class="section" id="categories-section" open>
+      <summary>Типы зданий</summary>
+      <label class="checkbox-row"><input type="checkbox" class="cat-toggle" value="residential" checked /> Жилые</label>
+      <label class="checkbox-row"><input type="checkbox" class="cat-toggle" value="commercial" checked /> Коммерция</label>
+      <label class="checkbox-row"><input type="checkbox" class="cat-toggle" value="education" checked /> Образование</label>
+      <label class="checkbox-row"><input type="checkbox" class="cat-toggle" value="healthcare" checked /> Медицина</label>
+      <label class="checkbox-row"><input type="checkbox" class="cat-toggle" value="industrial" checked /> Промышленность</label>
+      <label class="checkbox-row"><input type="checkbox" class="cat-toggle" value="civic" checked /> Общественные</label>
+      <label class="checkbox-row"><input type="checkbox" class="cat-toggle" value="other" checked /> Прочие</label>
+    </details>
+
     <details class="hint">
       <summary>Советы</summary>
       <p>Выбирайте небольшой участок (примерно до 600×600 м) — иначе Overpass API вернёт слишком много данных, и генерация будет долгой или вовсе не сработает.</p>

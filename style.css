@@ -68,6 +68,98 @@ button:hover:not(:disabled) { opacity: .85; }
 .hint p { margin: 6px 0; }
 .hint code { background: #0b1114; padding: 1px 5px; border-radius: 3px; }
 
+.section {
+  font-size: 13px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  margin-bottom: 4px;
+}
+.section summary {
+  cursor: pointer;
+  color: var(--text);
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.field-row { margin-bottom: 10px; }
+.field-row label {
+  display: block;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+.field-row input[type="number"] {
+  width: 100%;
+  background: #0b1114;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 5px;
+  padding: 6px 8px;
+  font-size: 13px;
+}
+
+.chip-group { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  background: #0b1114;
+  color: var(--text);
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.chip.active { background: var(--accent); color: #0b1114; border-color: var(--accent); }
+.chip:hover:not(.active) { border-color: var(--accent); }
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text);
+  margin-bottom: 8px;
+  cursor: pointer;
+}
+.checkbox-row input { accent-color: var(--accent); }
+
+.color-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+.color-row input[type="color"] {
+  width: 34px;
+  height: 24px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+}
+
+#btn-apply-camera {
+  width: 100%;
+  padding: 8px 10px;
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.readout {
+  font-size: 11px;
+  color: var(--accent);
+  line-height: 1.5;
+  margin: 4px 0;
+}
+.hint-text {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.4;
+  margin: 4px 0 0;
+}
+
 #stage { flex: 1; position: relative; }
 #map, #viewport { position: absolute; inset: 0; }
 #viewport { display: none; background: #cfe8ff; }

@@ -17,6 +17,8 @@ const drawnItems = new L.FeatureGroup();
 map.addLayer(drawnItems);
 
 let selectedBounds = null;
+let lastOsmData = null; // последние загруженные данные — для перестроения без повторного запроса
+let lastBounds = null;
 
 const btnDraw = document.getElementById('btn-draw');
 const btnGenerate = document.getElementById('btn-generate');
@@ -82,8 +84,6 @@ async function fetchOsmData(bounds) {
 /* ---------------------------------------------------------------------- */
 /*  Проекция координат в локальные метры                                  */
 /*  Система координат: X = восток, Y = высота (вверх), Z = юг.            */
-/*  Это правая (right-handed) тройка, эквивалентная повороту ENU —        */
-/*  никакого отражения формы контуров она не создаёт.                     */
 /* ---------------------------------------------------------------------- */
 
 function makeProjector(centerLat, centerLon) {
@@ -123,6 +123,34 @@ function roadWidth(tags) {
 }
 
 /* ---------------------------------------------------------------------- */
+/*  Категории зданий (для фильтра «что рисовать/экспортировать»)          */
+/* ---------------------------------------------------------------------- */
+
+const CATEGORY_MAP = {
+  residential: ['residential', 'apartments', 'house', 'detached', 'terrace', 'dormitory', 'semidetached_house', 'bungalow', 'cabin', 'static_caravan'],
+  commercial: ['commercial', 'retail', 'office', 'supermarket', 'kiosk', 'shop', 'hotel'],
+  education: ['school', 'university', 'college', 'kindergarten'],
+  healthcare: ['hospital', 'clinic'],
+  industrial: ['industrial', 'warehouse', 'factory', 'manufacture', 'barn', 'farm_auxiliary'],
+  civic: ['civic', 'government', 'public', 'church', 'cathedral', 'chapel', 'religious', 'museum', 'library', 'train_station', 'transportation']
+};
+function categorize(buildingValue) {
+  if (!buildingValue) return 'other';
+  for (const [cat, list] of Object.entries(CATEGORY_MAP)) {
+    if (list.includes(buildingValue)) return cat;
+  }
+  return 'other';
+}
+
+const enabledCategories = new Set(['residential', 'commercial', 'education', 'healthcare', 'industrial', 'civic', 'other']);
+document.querySelectorAll('.cat-toggle').forEach(cb => {
+  cb.addEventListener('change', () => {
+    if (cb.checked) enabledCategories.add(cb.value); else enabledCategories.delete(cb.value);
+    if (lastOsmData) buildScene(lastOsmData, lastBounds);
+  });
+});
+
+/* ---------------------------------------------------------------------- */
 /*  Ручная экструзия здания (высота строго вдоль Y, без поворотов меша)   */
 /* ---------------------------------------------------------------------- */
 
@@ -138,7 +166,6 @@ function buildingMesh(pts, height, wallMat, roofMat) {
 
   const group = new THREE.Group();
 
-  // стены: каждое ребро контура -> вертикальный квад от y=0 до y=height
   const wallPositions = [];
   for (let i = 0; i < ring.length; i++) {
     const a = ring[i], b = ring[(i + 1) % ring.length];
@@ -150,7 +177,6 @@ function buildingMesh(pts, height, wallMat, roofMat) {
   wallGeo.computeVertexNormals();
   group.add(new THREE.Mesh(wallGeo, wallMat));
 
-  // крыша: триангуляция контура в плане, все вершины на y=height
   try {
     const shapePts2D = ring.map(p => new THREE.Vector2(p.x, p.z));
     const triangles = THREE.ShapeUtils.triangulateShape(shapePts2D, []);
@@ -184,10 +210,25 @@ function ringCentroid(ring) {
 /*  Сцена Three.js                                                        */
 /* ---------------------------------------------------------------------- */
 
-let scene, camera, renderer, controls, css2dRenderer, viewportEl;
+let scene, camera, perspCamera, orthoCamera, renderer, controls, css2dRenderer, viewportEl;
+let wallMat, roofMat, roadMat, groundMat;
 let buildingLabels = []; // { text, x, y(height), z } — для SVG-экспорта
 let roadLabels = [];     // { text, x, z, angleDeg }  — для SVG-экспорта
 let cssLabelObjects = []; // CSS2DObject — живые подписи в 3D-сцене
+let currentSpan = 100;
+
+// состояние камеры — сохраняется между перестроениями сцены и разными
+// участками, чтобы можно было повторить один и тот же ракурс
+let camAzimuth = 165;      // градусы, 0 = север, 90 = восток, 180 = юг
+let camElevation = 45;     // градусы над горизонтом
+let camDistanceRatio = 1.3; // множитель от размера сцены
+let camFocalMM = 50;
+let camOrtho = false;
+
+function fovFromFocal(mm) {
+  // вертикальное поле зрения для полнокадрового сенсора 24×36мм
+  return 2 * Math.atan(12 / mm) * 180 / Math.PI;
+}
 
 function initThree() {
   viewportEl = document.getElementById('viewport');
@@ -195,7 +236,10 @@ function initThree() {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(0xcfe8ff);
 
-  camera = new THREE.PerspectiveCamera(50, viewportEl.clientWidth / Math.max(viewportEl.clientHeight, 1), 0.1, 10000);
+  const aspect = viewportEl.clientWidth / Math.max(viewportEl.clientHeight, 1);
+  perspCamera = new THREE.PerspectiveCamera(fovFromFocal(camFocalMM), aspect, 0.1, 20000);
+  orthoCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 20000);
+  camera = camOrtho ? orthoCamera : perspCamera;
 
   renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio);
@@ -208,19 +252,150 @@ function initThree() {
   css2dRenderer.domElement.style.pointerEvents = 'none';
   viewportEl.appendChild(css2dRenderer.domElement);
 
-  controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
+  initMaterials();
+  createControls();
 
   window.addEventListener('resize', onResize);
   animate();
 }
 
+function initMaterials() {
+  wallMat = new THREE.MeshLambertMaterial({ color: 0xc9b79c, side: THREE.DoubleSide });
+  roofMat = new THREE.MeshLambertMaterial({ color: 0x9c8a70, side: THREE.DoubleSide });
+  roadMat = new THREE.MeshBasicMaterial({ color: 0x555a5f, side: THREE.DoubleSide });
+  groundMat = new THREE.MeshLambertMaterial({ color: 0xdfe6d8 });
+}
+
+function createControls() {
+  if (controls) controls.dispose();
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.maxPolarAngle = Math.PI / 2 * 0.995; // не даём камере уйти под землю
+  controls.minPolarAngle = 0.02;
+  controls.addEventListener('change', onControlsChange);
+}
+
+function switchCameraType(toOrtho) {
+  camOrtho = toOrtho;
+  camera = camOrtho ? orthoCamera : perspCamera;
+  updatePerspFov();
+  updateOrthoFrustum();
+  createControls();
+  applyCameraSpherical();
+}
+
+function updatePerspFov() {
+  if (!perspCamera || !viewportEl) return;
+  perspCamera.fov = fovFromFocal(camFocalMM);
+  perspCamera.aspect = viewportEl.clientWidth / Math.max(viewportEl.clientHeight, 1);
+  perspCamera.updateProjectionMatrix();
+}
+
+function updateOrthoFrustum() {
+  if (!orthoCamera || !viewportEl) return;
+  const w = viewportEl.clientWidth, h = viewportEl.clientHeight;
+  const aspect = w / Math.max(h, 1);
+  const halfHeight = Math.max(currentSpan * 0.55 * (camDistanceRatio / 1.3), 1);
+  orthoCamera.left = -halfHeight * aspect;
+  orthoCamera.right = halfHeight * aspect;
+  orthoCamera.top = halfHeight;
+  orthoCamera.bottom = -halfHeight;
+  orthoCamera.near = 0.1;
+  orthoCamera.far = 20000;
+  orthoCamera.updateProjectionMatrix();
+}
+
+function applyCameraSpherical() {
+  if (!camera) return;
+  const dist = Math.max(currentSpan * camDistanceRatio, 1);
+  const az = camAzimuth * Math.PI / 180, el = camElevation * Math.PI / 180;
+  const x = dist * Math.cos(el) * Math.sin(az);
+  const y = dist * Math.sin(el);
+  const z = -dist * Math.cos(el) * Math.cos(az);
+  camera.position.set(x, y, z);
+  if (controls) {
+    controls.target.set(0, 0, 0);
+    controls.update();
+  }
+  updateOrthoFrustum();
+}
+
+function onControlsChange() {
+  if (!camera) return;
+  const p = camera.position;
+  const dist = p.length();
+  if (dist < 1e-6) return;
+  camElevation = Math.asin(THREE.MathUtils.clamp(p.y / dist, -1, 1)) * 180 / Math.PI;
+  camAzimuth = Math.atan2(p.x, -p.z) * 180 / Math.PI;
+  if (camAzimuth < 0) camAzimuth += 360;
+  if (currentSpan > 0) camDistanceRatio = dist / currentSpan;
+  updateReadout();
+}
+
+function updateReadout() {
+  const azEl = document.getElementById('cam-azimuth');
+  const elEl = document.getElementById('cam-elevation');
+  const distEl = document.getElementById('cam-distance');
+  const readoutEl = document.getElementById('camera-readout');
+  if (azEl) azEl.value = camAzimuth.toFixed(1);
+  if (elEl) elEl.value = camElevation.toFixed(1);
+  if (distEl) distEl.value = camDistanceRatio.toFixed(2);
+  if (readoutEl) {
+    readoutEl.textContent = `Азимут ${camAzimuth.toFixed(1)}°, высота ${camElevation.toFixed(1)}°, ` +
+      `дистанция ${camDistanceRatio.toFixed(2)}×, объектив ${camOrtho ? 'ортографический' : camFocalMM + 'мм'}`;
+  }
+}
+
+/* --- UI камеры --- */
+
+document.querySelectorAll('#focal-group .chip').forEach(btn => {
+  btn.addEventListener('click', () => {
+    camFocalMM = parseFloat(btn.dataset.focal);
+    document.querySelectorAll('#focal-group .chip').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const wasOrtho = camOrtho;
+    camOrtho = false;
+    const orthoToggle = document.getElementById('ortho-toggle');
+    if (orthoToggle) orthoToggle.checked = false;
+    if (!camera) { updateReadout(); return; }
+    if (wasOrtho) switchCameraType(false); else updatePerspFov();
+    updateReadout();
+  });
+});
+
+document.getElementById('ortho-toggle').addEventListener('change', (e) => {
+  camOrtho = e.target.checked;
+  if (!camera) { updateReadout(); return; }
+  switchCameraType(camOrtho);
+  updateReadout();
+});
+
+document.getElementById('btn-apply-camera').addEventListener('click', () => {
+  const az = parseFloat(document.getElementById('cam-azimuth').value);
+  const el = parseFloat(document.getElementById('cam-elevation').value);
+  const dist = parseFloat(document.getElementById('cam-distance').value);
+  if (!isNaN(az)) camAzimuth = az;
+  if (!isNaN(el)) camElevation = THREE.MathUtils.clamp(el, 1, 89);
+  if (!isNaN(dist) && dist > 0) camDistanceRatio = dist;
+  if (!camera) { updateReadout(); return; }
+  applyCameraSpherical();
+  updateReadout();
+});
+
+/* --- UI цветов --- */
+// материалы (wallMat/roofMat/roadMat/groundMat) создаются в initThree();
+// до первого «Построить 3D» изменение цвета просто ничего не делает.
+document.getElementById('color-wall').addEventListener('input', e => { if (wallMat) wallMat.color.set(e.target.value); });
+document.getElementById('color-roof').addEventListener('input', e => { if (roofMat) roofMat.color.set(e.target.value); });
+document.getElementById('color-road').addEventListener('input', e => { if (roadMat) roadMat.color.set(e.target.value); });
+document.getElementById('color-ground').addEventListener('input', e => { if (groundMat) groundMat.color.set(e.target.value); });
+
 function onResize() {
   if (!viewportEl || viewportEl.style.display === 'none') return;
   const w = viewportEl.clientWidth, h = viewportEl.clientHeight;
   if (w === 0 || h === 0) return;
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
+  updatePerspFov();
+  updateOrthoFrustum();
   renderer.setSize(w, h);
   css2dRenderer.setSize(w, h);
 }
@@ -244,7 +419,7 @@ function clearScene() {
     scene.remove(obj);
     obj.traverse(o => {
       if (o.geometry) o.geometry.dispose();
-      if (o.material) o.material.dispose();
+      // материалы переиспользуются между перестроениями — не удаляем их
     });
   }
 }
@@ -263,6 +438,8 @@ function buildScene(osmData, bounds) {
   clearScene();
   buildingLabels = [];
   roadLabels = [];
+  lastOsmData = osmData;
+  lastBounds = bounds;
 
   const center = bounds.getCenter();
   const project = makeProjector(center.lat, center.lng);
@@ -271,11 +448,10 @@ function buildScene(osmData, bounds) {
   const ne = project(bounds.getNorth(), bounds.getEast());
   const sceneWidth = Math.abs(ne.x - sw.x);
   const sceneDepth = Math.abs(sw.z - ne.z);
-  const span = Math.max(sceneWidth, sceneDepth, 10);
+  currentSpan = Math.max(sceneWidth, sceneDepth, 10);
 
   // земля
   const groundGeo = new THREE.PlaneGeometry(sceneWidth * 1.05, sceneDepth * 1.05);
-  const groundMat = new THREE.MeshLambertMaterial({ color: 0xdfe6d8 });
   const ground = new THREE.Mesh(groundGeo, groundMat);
   ground.rotation.x = -Math.PI / 2;
   scene.add(ground);
@@ -283,17 +459,10 @@ function buildScene(osmData, bounds) {
   // свет
   scene.add(new THREE.AmbientLight(0xffffff, 0.6));
   const sun = new THREE.DirectionalLight(0xffffff, 0.8);
-  sun.position.set(span * 0.3, span * 0.9, span * 0.6);
+  sun.position.set(currentSpan * 0.3, currentSpan * 0.9, currentSpan * 0.6);
   scene.add(sun);
 
-  const wallMat = new THREE.MeshLambertMaterial({ color: 0xc9b79c, side: THREE.DoubleSide });
-  const roofMat = new THREE.MeshLambertMaterial({ color: 0x9c8a70, side: THREE.DoubleSide });
-  const roadMat = new THREE.MeshBasicMaterial({ color: 0x555a5f, side: THREE.DoubleSide });
-
   let buildingsBuilt = 0, roadsBuilt = 0, skipped = 0;
-
-  // для дорог с одинаковым названием подписываем только самый длинный сегмент —
-  // иначе название улицы дублировалось бы десятки раз
   const roadNameBest = new Map(); // name -> { length, x, z, angleDeg }
 
   for (const el of osmData.elements) {
@@ -303,6 +472,8 @@ function buildScene(osmData, bounds) {
       .map(g => project(g.lat, g.lon));
 
     if (el.tags && el.tags.building) {
+      const cat = categorize(el.tags.building);
+      if (!enabledCategories.has(cat)) { skipped++; continue; }
       if (pts.length < 3) { skipped++; continue; }
       const height = buildingHeight(el.tags);
       const mesh = buildingMesh(pts, height, wallMat, roofMat);
@@ -349,13 +520,11 @@ function buildScene(osmData, bounds) {
     addCssLabel(name, info.x, 0.6, info.z, 'label-street');
   }
 
-  // Камера по умолчанию: с юга и сверху, глядя на север (как обычно
-  // ориентирована карта — север вверху, восток справа), а не по диагонали
-  // из угла — так вид не выглядит "перевёрнутым" относительно плоской карты.
-  const dist = span * 0.9 + 20;
-  camera.position.set(dist * 0.2, dist * 0.85, dist * 0.8);
-  controls.target.set(0, 0, 0);
-  controls.update();
+  // применяем текущий (сохранённый) ракурс камеры к новой сцене —
+  // так один и тот же угол легко повторить на другом участке
+  updatePerspFov();
+  applyCameraSpherical();
+  updateReadout();
 
   setStatus(`Готово. Зданий: ${buildingsBuilt}, дорог: ${roadsBuilt}` + (skipped ? `, пропущено: ${skipped}` : ''));
 }
