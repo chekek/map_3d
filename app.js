@@ -593,7 +593,7 @@ function buildScene(osmData, bounds) {
         scene.add(mesh);
         buildingsBuilt++;
         const ring = cleanRing(pts);
-        buildingShapes.push({ ring, height });
+        buildingShapes.push({ ring, height, num: tags['addr:housenumber'] || null });
         const num = tags['addr:housenumber'];
         if (num) {
           const c = ringCentroid(ring);
@@ -792,16 +792,29 @@ function faceDepth(ring3D) {
   return sum / ring3D.length;
 }
 
-function collectExportFaces() {
-  const faces = [];
+const EDGE_STROKE = '#2a2521';
+const EDGE_WIDTH = 2;
+
+function idFromNum(num, i) {
+  const base = num ? String(num).replace(/[^a-zA-Zа-яА-Я0-9]+/g, '-') : String(i);
+  return 'building-' + base;
+}
+
+// экспорт собирает не плоский список граней, а список «предметов»:
+// одиночная грань (земля/вода/дорога) или целое здание (группа из его
+// стен+крыши). Все они сортируются по глубине вперемешку, поэтому здание
+// как целое встаёт в общий порядок отрисовки корректно, а внутри здания
+// его собственные грани досортированы отдельно.
+function collectExportItems() {
+  const items = [];
   const wallColor = '#' + wallMat.color.getHexString();
   const roofColor = '#' + roofMat.color.getHexString();
   const roadColor = '#' + roadMat.color.getHexString();
   const waterColor = '#' + waterMat.color.getHexString();
   const groundColor = '#' + groundMat.color.getHexString();
 
-  faces.push({
-    color: groundColor,
+  items.push({
+    type: 'face', color: groundColor,
     ring: [
       { x: -groundHalfW, y: GROUND_Y, z: -groundHalfD },
       { x: groundHalfW, y: GROUND_Y, z: -groundHalfD },
@@ -811,27 +824,29 @@ function collectExportFaces() {
   });
 
   for (const ring of waterShapes) {
-    faces.push({ color: waterColor, ring: ring.map(p => ({ x: p.x, y: WATER_Y, z: p.z })) });
+    items.push({ type: 'face', color: waterColor, ring: ring.map(p => ({ x: p.x, y: WATER_Y, z: p.z })) });
   }
 
   for (const r of roadShapes) {
     const ring = roadRibbonRing3D(r.pts, r.width);
-    if (ring) faces.push({ color: roadColor, ring: ring.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
+    if (ring) items.push({ type: 'face', color: roadColor, ring: ring.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
   }
 
-  for (const b of buildingShapes) {
+  buildingShapes.forEach((b, i) => {
     const ring = b.ring, h = b.height;
-    for (let i = 0; i < ring.length; i++) {
-      const a = ring[i], c = ring[(i + 1) % ring.length];
+    const faces = [];
+    for (let k = 0; k < ring.length; k++) {
+      const a = ring[k], c = ring[(k + 1) % ring.length];
       faces.push({
         color: wallColor,
         ring: [{ x: a.x, y: 0, z: a.z }, { x: c.x, y: 0, z: c.z }, { x: c.x, y: h, z: c.z }, { x: a.x, y: h, z: a.z }]
       });
     }
     faces.push({ color: roofColor, ring: ring.map(p => ({ x: p.x, y: h, z: p.z })) });
-  }
+    items.push({ type: 'building', id: idFromNum(b.num, i), faces });
+  });
 
-  return faces;
+  return items;
 }
 
 function addLabelsToSvg(svgEl, w, h) {
@@ -865,13 +880,30 @@ function addLabelsToSvg(svgEl, w, h) {
   }
 }
 
+function makePathEl(NS, d, fillColor) {
+  const path = document.createElementNS(NS, 'path');
+  path.setAttribute('d', d);
+  path.setAttribute('fill', fillColor);
+  path.setAttribute('stroke', EDGE_STROKE);
+  path.setAttribute('stroke-width', String(EDGE_WIDTH));
+  path.setAttribute('stroke-linejoin', 'round');
+  return path;
+}
+
 function exportSvg() {
   const w = viewportEl.clientWidth, h = viewportEl.clientHeight;
   camera.updateMatrixWorld(true);
 
-  const faces = collectExportFaces();
-  for (const f of faces) f.depth = faceDepth(f.ring);
-  faces.sort((a, b) => a.depth - b.depth); // дальние (меньше depth) первыми
+  const items = collectExportItems();
+  for (const it of items) {
+    if (it.type === 'face') {
+      it.depth = faceDepth(it.ring);
+    } else {
+      for (const f of it.faces) f.depth = faceDepth(f.ring);
+      it.depth = it.faces.reduce((s, f) => s + f.depth, 0) / it.faces.length;
+    }
+  }
+  items.sort((a, b) => a.depth - b.depth); // дальние (меньше depth) первыми
 
   const NS = 'http://www.w3.org/2000/svg';
   const svgEl = document.createElementNS(NS, 'svg');
@@ -881,13 +913,24 @@ function exportSvg() {
   svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`);
   svgEl.setAttribute('style', 'background-color: rgb(207, 232, 255);');
 
-  for (const f of faces) {
-    const d = ringToPathD(f.ring, w, h);
-    if (!d) continue;
-    const path = document.createElementNS(NS, 'path');
-    path.setAttribute('d', d);
-    path.setAttribute('fill', f.color);
-    svgEl.appendChild(path);
+  for (const it of items) {
+    if (it.type === 'face') {
+      const d = ringToPathD(it.ring, w, h);
+      if (!d) continue;
+      svgEl.appendChild(makePathEl(NS, d, it.color));
+    } else {
+      const g = document.createElementNS(NS, 'g');
+      g.setAttribute('id', it.id);
+      const sortedFaces = it.faces.slice().sort((a, b) => a.depth - b.depth);
+      let any = false;
+      for (const f of sortedFaces) {
+        const d = ringToPathD(f.ring, w, h);
+        if (!d) continue;
+        g.appendChild(makePathEl(NS, d, f.color));
+        any = true;
+      }
+      if (any) svgEl.appendChild(g);
+    }
   }
 
   addLabelsToSvg(svgEl, w, h);
