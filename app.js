@@ -135,8 +135,8 @@ function roadWidth(tags) {
 }
 
 const GROUND_Y = 0;
-const WATER_Y = 0.05;
-const ROAD_Y = 0.18; // заметно выше земли, чтобы не было z-fighting
+const WATER_Y = 0.12;
+const ROAD_Y = 0.24; // заметно выше воды, чтобы не было z-fighting
 
 /* ---------------------------------------------------------------------- */
 /*  Классификация way: вода / здание (и его категория) / дорога            */
@@ -747,27 +747,27 @@ function svgTextNode(text, x, y, opts) {
   return t;
 }
 
-// ширина ленты дороги в 3D-точках (без проекции) — переиспользуется и для
-// экспорта, и как основа геометрии в самой 3D-сцене
-function roadRibbonRing3D(pts, width) {
-  if (pts.length < 2) return null;
+// дорога как набор прямоугольников-сегментов (по одному на пару соседних
+// точек), а не один цельный контур: у цельного контура на резких изгибах
+// внутренняя сторона самопересекается и даёт «схлопнутый» пинч на скрине.
+// Сегменты слегка перехлёстываются на стыках — незаметно, цвет один и тот же.
+function roadSegmentQuads3D(pts, width) {
   const half = width / 2;
-  const left = [], right = [];
+  const quads = [];
   for (let i = 0; i < pts.length - 1; i++) {
     const a = pts[i], b = pts[i + 1];
     const dx = b.x - a.x, dz = b.z - a.z;
     const len = Math.sqrt(dx * dx + dz * dz);
     if (len < 1e-6) continue;
     const nx = -dz / len * half, nz = dx / len * half;
-    if (left.length === 0) {
-      left.push({ x: a.x + nx, z: a.z + nz });
-      right.push({ x: a.x - nx, z: a.z - nz });
-    }
-    left.push({ x: b.x + nx, z: b.z + nz });
-    right.push({ x: b.x - nx, z: b.z - nz });
+    quads.push([
+      { x: a.x + nx, z: a.z + nz },
+      { x: b.x + nx, z: b.z + nz },
+      { x: b.x - nx, z: b.z - nz },
+      { x: a.x - nx, z: a.z - nz }
+    ]);
   }
-  if (left.length < 2) return null;
-  return left.concat(right.reverse());
+  return quads;
 }
 
 // один контур (3D-точки) -> один <path> в экранных координатах; null, если
@@ -828,8 +828,14 @@ function collectExportItems() {
   }
 
   for (const r of roadShapes) {
-    const ring = roadRibbonRing3D(r.pts, r.width);
-    if (ring) items.push({ type: 'face', color: roadColor, ring: ring.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
+    const quads = roadSegmentQuads3D(r.pts, r.width);
+    for (const q of quads) {
+      items.push({ type: 'face', road: true, color: roadColor, ring: q.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
+      // продольные кромки — отдельными линиями, без обводки коротких торцов
+      // сегмента (иначе на каждом узле OSM была бы поперечная «риска»)
+      items.push({ type: 'line', pts: [{ x: q[0].x, y: ROAD_Y, z: q[0].z }, { x: q[1].x, y: ROAD_Y, z: q[1].z }] });
+      items.push({ type: 'line', pts: [{ x: q[3].x, y: ROAD_Y, z: q[3].z }, { x: q[2].x, y: ROAD_Y, z: q[2].z }] });
+    }
   }
 
   buildingShapes.forEach((b, i) => {
@@ -880,13 +886,15 @@ function addLabelsToSvg(svgEl, w, h) {
   }
 }
 
-function makePathEl(NS, d, fillColor) {
+function makePathEl(NS, d, fillColor, noStroke) {
   const path = document.createElementNS(NS, 'path');
   path.setAttribute('d', d);
   path.setAttribute('fill', fillColor);
-  path.setAttribute('stroke', EDGE_STROKE);
-  path.setAttribute('stroke-width', String(EDGE_WIDTH));
-  path.setAttribute('stroke-linejoin', 'round');
+  if (!noStroke) {
+    path.setAttribute('stroke', EDGE_STROKE);
+    path.setAttribute('stroke-width', String(EDGE_WIDTH));
+    path.setAttribute('stroke-linejoin', 'round');
+  }
   return path;
 }
 
@@ -898,6 +906,8 @@ function exportSvg() {
   for (const it of items) {
     if (it.type === 'face') {
       it.depth = faceDepth(it.ring);
+    } else if (it.type === 'line') {
+      it.depth = faceDepth(it.pts);
     } else {
       for (const f of it.faces) f.depth = faceDepth(f.ring);
       it.depth = it.faces.reduce((s, f) => s + f.depth, 0) / it.faces.length;
@@ -917,7 +927,18 @@ function exportSvg() {
     if (it.type === 'face') {
       const d = ringToPathD(it.ring, w, h);
       if (!d) continue;
-      svgEl.appendChild(makePathEl(NS, d, it.color));
+      svgEl.appendChild(makePathEl(NS, d, it.color, it.road));
+    } else if (it.type === 'line') {
+      const p0 = project2D(it.pts[0].x, it.pts[0].y, it.pts[0].z, w, h);
+      const p1 = project2D(it.pts[1].x, it.pts[1].y, it.pts[1].z, w, h);
+      if (!p0.visible && !p1.visible) continue;
+      const line = document.createElementNS(NS, 'path');
+      line.setAttribute('d', `M${p0.x.toFixed(1)},${p0.y.toFixed(1)} L${p1.x.toFixed(1)},${p1.y.toFixed(1)}`);
+      line.setAttribute('fill', 'none');
+      line.setAttribute('stroke', EDGE_STROKE);
+      line.setAttribute('stroke-width', String(EDGE_WIDTH));
+      line.setAttribute('stroke-linecap', 'round');
+      svgEl.appendChild(line);
     } else {
       const g = document.createElementNS(NS, 'g');
       g.setAttribute('id', it.id);
