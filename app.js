@@ -282,9 +282,11 @@ function ringCentroid(ring) {
 let scene, camera, perspCamera, orthoCamera, renderer, controls, css2dRenderer, viewportEl;
 let wallMat, roofMat, roadMat, groundMat, waterMat;
 let buildingLabels = []; // { text, x, y(height), z } — для SVG-экспорта
+let roadShapes = [];     // { pts:[{x,z}], width } — для чистой отрисовки дорог в SVG одним контуром
 let roadLabels = [];     // { text, x, z, angleDeg }  — для SVG-экспорта
 let cssLabelObjects = []; // CSS2DObject — живые подписи в 3D-сцене
 let currentSpan = 100;
+let roadsGroup = null; // группа мешей дорог — прячем при SVG-экспорте, рисуем вместо них чистый контур
 
 // состояние камеры — сохраняется между перестроениями сцены и разными
 // участками, чтобы можно было повторить один и тот же ракурс
@@ -329,11 +331,11 @@ function initThree() {
 }
 
 function initMaterials() {
-  wallMat = new THREE.MeshLambertMaterial({ color: 0xc9b79c, side: THREE.DoubleSide });
-  roofMat = new THREE.MeshLambertMaterial({ color: 0x9c8a70, side: THREE.DoubleSide });
+  wallMat = new THREE.MeshBasicMaterial({ color: 0xc9b79c, side: THREE.DoubleSide });
+  roofMat = new THREE.MeshBasicMaterial({ color: 0x9c8a70, side: THREE.DoubleSide });
   roadMat = new THREE.MeshBasicMaterial({ color: 0x555a5f, side: THREE.DoubleSide });
-  groundMat = new THREE.MeshLambertMaterial({ color: 0xdfe6d8 });
-  waterMat = new THREE.MeshLambertMaterial({ color: 0x6fa8dc, side: THREE.DoubleSide });
+  groundMat = new THREE.MeshBasicMaterial({ color: 0xdfe6d8 });
+  waterMat = new THREE.MeshBasicMaterial({ color: 0x6fa8dc, side: THREE.DoubleSide });
 }
 
 function createControls() {
@@ -521,6 +523,7 @@ function buildScene(osmData, bounds) {
   clearScene();
   buildingLabels = [];
   roadLabels = [];
+  roadShapes = [];
   lastOsmData = osmData;
   lastBounds = bounds;
 
@@ -540,12 +543,8 @@ function buildScene(osmData, bounds) {
   ground.position.y = GROUND_Y;
   scene.add(ground);
 
-  // свет
-  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-  const sun = new THREE.DirectionalLight(0xffffff, 0.8);
-  sun.position.set(currentSpan * 0.3, currentSpan * 0.9, currentSpan * 0.6);
-  scene.add(sun);
-
+  roadsGroup = new THREE.Group();
+  scene.add(roadsGroup);
   let buildingsBuilt = 0, roadsBuilt = 0, waterBuilt = 0, skipped = 0;
   const roadNameBest = new Map(); // name -> { length, x, z, angleDeg }
 
@@ -602,8 +601,9 @@ function buildScene(osmData, bounds) {
       if (geo) {
         const mesh = new THREE.Mesh(geo, roadMat);
         mesh.position.y = ROAD_Y;
-        scene.add(mesh);
+        roadsGroup.add(mesh);
         roadsBuilt++;
+        roadShapes.push({ pts, width });
       }
       const name = tags.name;
       if (name) {
@@ -731,6 +731,48 @@ function svgTextNode(text, x, y, opts) {
   return t;
 }
 
+/* Дорога рисуется в SVG ОДНИМ цельным контуром (лента вдоль осевой линии,
+   ширина зависит от класса дороги — магистрали шире, дворовые проезды и
+   тропинки тоньше), а не набором треугольников от SVGRenderer. Это разом
+   убирает и швы на изгибах дороги, и лишние узлы в файле. */
+function roadRibbonPathD(pts, width, w, h) {
+  if (pts.length < 2) return null;
+  const half = width / 2;
+  const left = [], right = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    const a = pts[i], b = pts[i + 1];
+    const dx = b.x - a.x, dz = b.z - a.z;
+    const len = Math.sqrt(dx * dx + dz * dz);
+    if (len < 1e-6) continue;
+    const nx = -dz / len * half, nz = dx / len * half;
+    if (left.length === 0) {
+      left.push({ x: a.x + nx, z: a.z + nz });
+      right.push({ x: a.x - nx, z: a.z - nz });
+    }
+    left.push({ x: b.x + nx, z: b.z + nz });
+    right.push({ x: b.x - nx, z: b.z - nz });
+  }
+  if (left.length < 2) return null;
+  const ring = left.concat(right.reverse());
+  const pr = ring.map(p => project2D(p.x, ROAD_Y, p.z, w, h));
+  let d = '';
+  pr.forEach((p, i) => { d += (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ',' + p.y.toFixed(1) + ' '; });
+  return d + 'Z';
+}
+
+function addRoadsToSvg(svgEl, w, h) {
+  const color = '#' + roadMat.color.getHexString();
+  for (const r of roadShapes) {
+    const d = roadRibbonPathD(r.pts, r.width, w, h);
+    if (!d) continue;
+    const NS = 'http://www.w3.org/2000/svg';
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', d);
+    path.setAttribute('fill', color);
+    svgEl.appendChild(path);
+  }
+}
+
 function addLabelsToSvg(svgEl, w, h) {
   camera.updateMatrixWorld();
   const margin = 40;
@@ -772,13 +814,19 @@ function exportSvg() {
   // это буквально одни и те же координаты), поэтому щелей нет и без него.
   svgRenderer.overdraw = 0;
   svgRenderer.setSize(w, h);
+
+  // дороги рисуются не через SVGRenderer (много мелких треугольников на
+  // изгибах), а отдельно — одним цельным контуром на дорогу
+  if (roadsGroup) roadsGroup.visible = false;
   svgRenderer.render(scene, camera);
+  if (roadsGroup) roadsGroup.visible = true;
 
   const svgEl = svgRenderer.domElement;
   svgEl.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
   svgEl.setAttribute('width', String(w));
   svgEl.setAttribute('height', String(h));
 
+  addRoadsToSvg(svgEl, w, h);
   addLabelsToSvg(svgEl, w, h);
 
   const serializer = new XMLSerializer();
