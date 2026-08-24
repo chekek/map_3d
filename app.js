@@ -1,6 +1,5 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { SVGRenderer } from 'three/addons/renderers/SVGRenderer.js';
 import { CSS2DRenderer, CSS2DObject } from 'three/addons/renderers/CSS2DRenderer.js';
 import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
 
@@ -282,11 +281,14 @@ function ringCentroid(ring) {
 let scene, camera, perspCamera, orthoCamera, renderer, controls, css2dRenderer, viewportEl;
 let wallMat, roofMat, roadMat, groundMat, waterMat;
 let buildingLabels = []; // { text, x, y(height), z } — для SVG-экспорта
-let roadShapes = [];     // { pts:[{x,z}], width } — для чистой отрисовки дорог в SVG одним контуром
+let roadShapes = [];     // { pts:[{x,z}], width } — контур дороги для SVG
+let buildingShapes = []; // { ring:[{x,z}], height } — контур здания для SVG
+let waterShapes = [];    // [{x,z}] — контур водоёма для SVG
 let roadLabels = [];     // { text, x, z, angleDeg }  — для SVG-экспорта
 let cssLabelObjects = []; // CSS2DObject — живые подписи в 3D-сцене
 let currentSpan = 100;
-let roadsGroup = null; // группа мешей дорог — прячем при SVG-экспорте, рисуем вместо них чистый контур
+let groundHalfW = 50, groundHalfD = 50;
+let roadsGroup = null; // группа мешей дорог в 3D-сцене (для WebGL-вида)
 
 // состояние камеры — сохраняется между перестроениями сцены и разными
 // участками, чтобы можно было повторить один и тот же ракурс
@@ -524,6 +526,8 @@ function buildScene(osmData, bounds) {
   buildingLabels = [];
   roadLabels = [];
   roadShapes = [];
+  buildingShapes = [];
+  waterShapes = [];
   lastOsmData = osmData;
   lastBounds = bounds;
 
@@ -537,6 +541,8 @@ function buildScene(osmData, bounds) {
   currentSpan = Math.max(sceneWidth, sceneDepth, 10);
 
   // земля
+  groundHalfW = sceneWidth * 1.05 / 2;
+  groundHalfD = sceneDepth * 1.05 / 2;
   const groundGeo = new THREE.PlaneGeometry(sceneWidth * 1.05, sceneDepth * 1.05);
   const ground = new THREE.Mesh(groundGeo, groundMat);
   ground.rotation.x = -Math.PI / 2;
@@ -563,7 +569,7 @@ function buildScene(osmData, bounds) {
             .filter(g => g && typeof g.lat === 'number' && typeof g.lon === 'number')
             .map(g => project(g.lat, g.lon));
           const mesh = flatPolygonMesh(mpts, WATER_Y, waterMat);
-          if (mesh) { scene.add(mesh); waterBuilt++; } else { skipped++; }
+          if (mesh) { scene.add(mesh); waterBuilt++; waterShapes.push(cleanRing(mpts)); } else { skipped++; }
         }
       }
       continue;
@@ -576,7 +582,7 @@ function buildScene(osmData, bounds) {
 
     if (isWaterWay(tags)) {
       const mesh = flatPolygonMesh(pts, WATER_Y, waterMat);
-      if (mesh) { scene.add(mesh); waterBuilt++; } else { skipped++; }
+      if (mesh) { scene.add(mesh); waterBuilt++; waterShapes.push(cleanRing(pts)); } else { skipped++; }
     } else if (isBuildingLikeWay(tags)) {
       const cat = categorize(tags);
       if (!enabledCategories.has(cat)) { skipped++; continue; }
@@ -586,9 +592,11 @@ function buildScene(osmData, bounds) {
       if (mesh) {
         scene.add(mesh);
         buildingsBuilt++;
+        const ring = cleanRing(pts);
+        buildingShapes.push({ ring, height });
         const num = tags['addr:housenumber'];
         if (num) {
-          const c = ringCentroid(cleanRing(pts));
+          const c = ringCentroid(ring);
           buildingLabels.push({ text: num, x: c.x, y: height + 0.3, z: c.z });
           addCssLabel(num, c.x, height + 0.3, c.z, 'label-housenum');
         }
@@ -695,7 +703,15 @@ btnBack.addEventListener('click', () => {
 btnExport.addEventListener('click', exportSvg);
 
 /* ---------------------------------------------------------------------- */
-/*  Экспорт в SVG + подписи домов и улиц                                  */
+/*  Экспорт в SVG — БЕЗ SVGRenderer                                        */
+/*                                                                          */
+/*  SVGRenderer всегда рисует один <path> на один треугольник — склеить    */
+/*  их в цельный контур средствами three.js нельзя, поэтому лишние узлы    */
+/*  и швы приходилось чистить вручную. Вместо этого экспорт строит SVG     */
+/*  сам: одна грань исходного объекта (стена, крыша, водоём, дорога,       */
+/*  земля) — один <path>. Порядок отрисовки (что спереди/сзади) считаем    */
+/*  вручную — «алгоритм художника»: грани сортируются по глубине в         */
+/*  системе координат камеры и рисуются от дальних к ближним.              */
 /* ---------------------------------------------------------------------- */
 
 function project2D(x, y, z, w, h) {
@@ -731,11 +747,9 @@ function svgTextNode(text, x, y, opts) {
   return t;
 }
 
-/* Дорога рисуется в SVG ОДНИМ цельным контуром (лента вдоль осевой линии,
-   ширина зависит от класса дороги — магистрали шире, дворовые проезды и
-   тропинки тоньше), а не набором треугольников от SVGRenderer. Это разом
-   убирает и швы на изгибах дороги, и лишние узлы в файле. */
-function roadRibbonPathD(pts, width, w, h) {
+// ширина ленты дороги в 3D-точках (без проекции) — переиспользуется и для
+// экспорта, и как основа геометрии в самой 3D-сцене
+function roadRibbonRing3D(pts, width) {
   if (pts.length < 2) return null;
   const half = width / 2;
   const left = [], right = [];
@@ -753,24 +767,71 @@ function roadRibbonPathD(pts, width, w, h) {
     right.push({ x: b.x - nx, z: b.z - nz });
   }
   if (left.length < 2) return null;
-  const ring = left.concat(right.reverse());
-  const pr = ring.map(p => project2D(p.x, ROAD_Y, p.z, w, h));
+  return left.concat(right.reverse());
+}
+
+// один контур (3D-точки) -> один <path> в экранных координатах; null, если
+// грань целиком оказалась за камерой
+function ringToPathD(ring3D, w, h) {
+  const pr = ring3D.map(p => project2D(p.x, p.y, p.z, w, h));
+  if (pr.every(p => !p.visible)) return null;
   let d = '';
   pr.forEach((p, i) => { d += (i === 0 ? 'M' : 'L') + p.x.toFixed(1) + ',' + p.y.toFixed(1) + ' '; });
   return d + 'Z';
 }
 
-function addRoadsToSvg(svgEl, w, h) {
-  const color = '#' + roadMat.color.getHexString();
-  for (const r of roadShapes) {
-    const d = roadRibbonPathD(r.pts, r.width, w, h);
-    if (!d) continue;
-    const NS = 'http://www.w3.org/2000/svg';
-    const path = document.createElementNS(NS, 'path');
-    path.setAttribute('d', d);
-    path.setAttribute('fill', color);
-    svgEl.appendChild(path);
+// глубина грани в системе координат камеры (среднее по вершинам) —
+// для сортировки «от дальних к ближним», как классический painter's algorithm
+function faceDepth(ring3D) {
+  let sum = 0;
+  const v = new THREE.Vector3();
+  for (const p of ring3D) {
+    v.set(p.x, p.y, p.z).applyMatrix4(camera.matrixWorldInverse);
+    sum += v.z;
   }
+  return sum / ring3D.length;
+}
+
+function collectExportFaces() {
+  const faces = [];
+  const wallColor = '#' + wallMat.color.getHexString();
+  const roofColor = '#' + roofMat.color.getHexString();
+  const roadColor = '#' + roadMat.color.getHexString();
+  const waterColor = '#' + waterMat.color.getHexString();
+  const groundColor = '#' + groundMat.color.getHexString();
+
+  faces.push({
+    color: groundColor,
+    ring: [
+      { x: -groundHalfW, y: GROUND_Y, z: -groundHalfD },
+      { x: groundHalfW, y: GROUND_Y, z: -groundHalfD },
+      { x: groundHalfW, y: GROUND_Y, z: groundHalfD },
+      { x: -groundHalfW, y: GROUND_Y, z: groundHalfD }
+    ]
+  });
+
+  for (const ring of waterShapes) {
+    faces.push({ color: waterColor, ring: ring.map(p => ({ x: p.x, y: WATER_Y, z: p.z })) });
+  }
+
+  for (const r of roadShapes) {
+    const ring = roadRibbonRing3D(r.pts, r.width);
+    if (ring) faces.push({ color: roadColor, ring: ring.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
+  }
+
+  for (const b of buildingShapes) {
+    const ring = b.ring, h = b.height;
+    for (let i = 0; i < ring.length; i++) {
+      const a = ring[i], c = ring[(i + 1) % ring.length];
+      faces.push({
+        color: wallColor,
+        ring: [{ x: a.x, y: 0, z: a.z }, { x: c.x, y: 0, z: c.z }, { x: c.x, y: h, z: c.z }, { x: a.x, y: h, z: a.z }]
+      });
+    }
+    faces.push({ color: roofColor, ring: ring.map(p => ({ x: p.x, y: h, z: p.z })) });
+  }
+
+  return faces;
 }
 
 function addLabelsToSvg(svgEl, w, h) {
@@ -806,27 +867,29 @@ function addLabelsToSvg(svgEl, w, h) {
 
 function exportSvg() {
   const w = viewportEl.clientWidth, h = viewportEl.clientHeight;
-  const svgRenderer = new SVGRenderer();
-  // overdraw расширяет каждый треугольник независимо вдоль его нормали —
-  // на плоских стыках это скрывает волосяные щели, но на рёбрах здания,
-  // где грани сходятся под углом, даёт заметные «шипы» на углах.
-  // Вершины стен/крыш/дорог уже склеены через mergeVertices (общее ребро —
-  // это буквально одни и те же координаты), поэтому щелей нет и без него.
-  svgRenderer.overdraw = 0;
-  svgRenderer.setSize(w, h);
+  camera.updateMatrixWorld(true);
 
-  // дороги рисуются не через SVGRenderer (много мелких треугольников на
-  // изгибах), а отдельно — одним цельным контуром на дорогу
-  if (roadsGroup) roadsGroup.visible = false;
-  svgRenderer.render(scene, camera);
-  if (roadsGroup) roadsGroup.visible = true;
+  const faces = collectExportFaces();
+  for (const f of faces) f.depth = faceDepth(f.ring);
+  faces.sort((a, b) => a.depth - b.depth); // дальние (меньше depth) первыми
 
-  const svgEl = svgRenderer.domElement;
-  svgEl.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
+  const NS = 'http://www.w3.org/2000/svg';
+  const svgEl = document.createElementNS(NS, 'svg');
+  svgEl.setAttribute('xmlns', NS);
   svgEl.setAttribute('width', String(w));
   svgEl.setAttribute('height', String(h));
+  svgEl.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svgEl.setAttribute('style', 'background-color: rgb(207, 232, 255);');
 
-  addRoadsToSvg(svgEl, w, h);
+  for (const f of faces) {
+    const d = ringToPathD(f.ring, w, h);
+    if (!d) continue;
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', d);
+    path.setAttribute('fill', f.color);
+    svgEl.appendChild(path);
+  }
+
   addLabelsToSvg(svgEl, w, h);
 
   const serializer = new XMLSerializer();
