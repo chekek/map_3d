@@ -749,25 +749,37 @@ function svgTextNode(text, x, y, opts) {
 
 // дорога как набор прямоугольников-сегментов (по одному на пару соседних
 // точек), а не один цельный контур: у цельного контура на резких изгибах
-// внутренняя сторона самопересекается и даёт «схлопнутый» пинч на скрине.
-// Сегменты слегка перехлёстываются на стыках — незаметно, цвет один и тот же.
-function roadSegmentQuads3D(pts, width) {
+// внутренняя сторона самопересекается и даёт «схлопнутый» пинч.
+// Но независимые сегменты на частых поворотах (круговое движение) дают
+// обратную проблему — маленькие клинья-щели между соседними сегментами
+// с внешней стороны поворота. Закрываем их треугольником-заплаткой в
+// каждом стыке (с обеих сторон полосы).
+function roadSegmentsWithJoints3D(pts, width) {
   const half = width / 2;
-  const quads = [];
+  const segs = [];
   for (let i = 0; i < pts.length - 1; i++) {
     const a = pts[i], b = pts[i + 1];
     const dx = b.x - a.x, dz = b.z - a.z;
     const len = Math.sqrt(dx * dx + dz * dz);
     if (len < 1e-6) continue;
     const nx = -dz / len * half, nz = dx / len * half;
-    quads.push([
-      { x: a.x + nx, z: a.z + nz },
-      { x: b.x + nx, z: b.z + nz },
-      { x: b.x - nx, z: b.z - nz },
-      { x: a.x - nx, z: a.z - nz }
-    ]);
+    segs.push({
+      aPt: a, bPt: b,
+      leftA: { x: a.x + nx, z: a.z + nz }, leftB: { x: b.x + nx, z: b.z + nz },
+      rightA: { x: a.x - nx, z: a.z - nz }, rightB: { x: b.x - nx, z: b.z - nz }
+    });
   }
-  return quads;
+
+  const quads = segs.map(s => [s.leftA, s.leftB, s.rightB, s.rightA]);
+
+  const joints = [];
+  for (let i = 0; i < segs.length - 1; i++) {
+    const s0 = segs[i], s1 = segs[i + 1];
+    joints.push([s0.bPt, s0.leftB, s1.leftA]);
+    joints.push([s0.bPt, s0.rightB, s1.rightA]);
+  }
+
+  return { quads, joints };
 }
 
 // один контур (3D-точки) -> один <path> в экранных координатах; null, если
@@ -790,6 +802,22 @@ function faceDepth(ring3D) {
     sum += v.z;
   }
   return sum / ring3D.length;
+}
+
+// глубина по БЛИЖАЙШЕЙ к камере вершине грани (не по средней). На выпуклой
+// коробке разницы почти нет, а вот на вогнутом (Г/П-образном) здании
+// среднее по всем вершинам грани может обмануть: у двух стен во внутреннем
+// углу оно почти совпадает, хотя по факту они по-разному «выступают» к
+// камере в разных точках — отсюда вывернутые/наложенные друг на друга
+// стены. Сортировка по ближайшей точке резко снижает такие ошибки.
+function faceDepthClosest(ring3D) {
+  let closest = -Infinity;
+  const v = new THREE.Vector3();
+  for (const p of ring3D) {
+    v.set(p.x, p.y, p.z).applyMatrix4(camera.matrixWorldInverse);
+    if (v.z > closest) closest = v.z;
+  }
+  return closest;
 }
 
 const EDGE_STROKE = '#2a2521';
@@ -828,13 +856,16 @@ function collectExportItems() {
   }
 
   for (const r of roadShapes) {
-    const quads = roadSegmentQuads3D(r.pts, r.width);
+    const { quads, joints } = roadSegmentsWithJoints3D(r.pts, r.width);
     for (const q of quads) {
       items.push({ type: 'face', road: true, color: roadColor, ring: q.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
       // продольные кромки — отдельными линиями, без обводки коротких торцов
       // сегмента (иначе на каждом узле OSM была бы поперечная «риска»)
       items.push({ type: 'line', pts: [{ x: q[0].x, y: ROAD_Y, z: q[0].z }, { x: q[1].x, y: ROAD_Y, z: q[1].z }] });
       items.push({ type: 'line', pts: [{ x: q[3].x, y: ROAD_Y, z: q[3].z }, { x: q[2].x, y: ROAD_Y, z: q[2].z }] });
+    }
+    for (const j of joints) {
+      items.push({ type: 'face', road: true, color: roadColor, ring: j.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
     }
   }
 
@@ -909,7 +940,7 @@ function exportSvg() {
     } else if (it.type === 'line') {
       it.depth = faceDepth(it.pts);
     } else {
-      for (const f of it.faces) f.depth = faceDepth(f.ring);
+      for (const f of it.faces) f.depth = faceDepthClosest(f.ring);
       it.depth = it.faces.reduce((s, f) => s + f.depth, 0) / it.faces.length;
     }
   }
