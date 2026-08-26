@@ -879,7 +879,7 @@ function collectExportItems() {
         ring: [{ x: a.x, y: 0, z: a.z }, { x: c.x, y: 0, z: c.z }, { x: c.x, y: h, z: c.z }, { x: a.x, y: h, z: a.z }]
       });
     }
-    faces.push({ color: roofColor, ring: ring.map(p => ({ x: p.x, y: h, z: p.z })) });
+    faces.push({ color: roofColor, roof: true, ring: ring.map(p => ({ x: p.x, y: h, z: p.z })) });
     items.push({ type: 'building', id: idFromNum(b.num, i), faces });
   });
 
@@ -973,7 +973,14 @@ function exportSvg() {
     } else {
       const g = document.createElementNS(NS, 'g');
       g.setAttribute('id', it.id);
-      const sortedFaces = it.faces.slice().sort((a, b) => a.depth - b.depth);
+      // крыша — верхняя точка здания, ниже собственных стен быть не может,
+      // поэтому её всегда рисуем последней (сверху), без депт-сортировки:
+      // у крыши и стены общее ребро (верх стены), и на нём сортировка по
+      // ближайшей точке даёт ничью — решает только вторая пара точек,
+      // из-за чего вдоль периметра получалась рваная граница
+      const wallFaces = it.faces.filter(f => !f.roof).sort((a, b) => a.depth - b.depth);
+      const roofFace = it.faces.find(f => f.roof);
+      const sortedFaces = roofFace ? wallFaces.concat([roofFace]) : wallFaces;
       let any = false;
       for (const f of sortedFaces) {
         const d = ringToPathD(f.ring, w, h);
