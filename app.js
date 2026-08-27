@@ -779,7 +779,24 @@ function roadSegmentsWithJoints3D(pts, width) {
     joints.push([s0.bPt, s0.rightB, s1.rightA]);
   }
 
-  return { quads, joints };
+  return { quads, joints, segs };
+}
+
+// круг-заплатка в узле, где сходятся концы РАЗНЫХ way (перекрёсток, развилка,
+// смена названия улицы и т.п.) — treugolniki-стыки выше закрывают щели только
+// между соседними сегментами ОДНОГО way, а тут может быть любое число дорог
+// под любым углом, так что универсальнее просто залить круг
+function circlePolygon3D(center, radius, segments) {
+  const ring = [];
+  for (let i = 0; i < segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    ring.push({ x: center.x + Math.cos(a) * radius, z: center.z + Math.sin(a) * radius });
+  }
+  return ring;
+}
+
+function roundKey(x, z) {
+  return x.toFixed(2) + '_' + z.toFixed(2);
 }
 
 // один контур (3D-точки) -> один <path> в экранных координатах; null, если
@@ -855,8 +872,11 @@ function collectExportItems() {
     items.push({ type: 'face', color: waterColor, ring: ring.map(p => ({ x: p.x, y: WATER_Y, z: p.z })) });
   }
 
-  for (const r of roadShapes) {
-    const { quads, joints } = roadSegmentsWithJoints3D(r.pts, r.width);
+  const wayEndpoints = new Map(); // roundKey -> [{ roadIdx, halfWidth }]
+  const allWaySegs = roadShapes.map(r => roadSegmentsWithJoints3D(r.pts, r.width));
+
+  roadShapes.forEach((r, roadIdx) => {
+    const { quads, joints, segs } = allWaySegs[roadIdx];
     for (const q of quads) {
       items.push({ type: 'face', road: true, color: roadColor, ring: q.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
       // продольные кромки — отдельными линиями, без обводки коротких торцов
@@ -867,6 +887,26 @@ function collectExportItems() {
     for (const j of joints) {
       items.push({ type: 'face', road: true, color: roadColor, ring: j.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
     }
+    // запоминаем крайние точки этой дороги (начало и конец way) — стыки
+    // между сегментами ОДНОГО way уже закрыты треугольниками выше, а вот
+    // границы между РАЗНЫМИ way (пересечение, развилка, смена улицы)
+    // нужно поймать отдельно
+    if (segs.length > 0) {
+      const halfWidth = r.width / 2;
+      for (const pt of [segs[0].aPt, segs[segs.length - 1].bPt]) {
+        const key = roundKey(pt.x, pt.z);
+        if (!wayEndpoints.has(key)) wayEndpoints.set(key, []);
+        wayEndpoints.get(key).push({ pt, roadIdx, halfWidth });
+      }
+    }
+  });
+
+  for (const entries of wayEndpoints.values()) {
+    const roadIdxSet = new Set(entries.map(e => e.roadIdx));
+    if (roadIdxSet.size < 2) continue; // не перекрёсток разных way — уже закрыто
+    const radius = Math.max(...entries.map(e => e.halfWidth));
+    const circle = circlePolygon3D(entries[0].pt, radius, 16);
+    items.push({ type: 'face', road: true, color: roadColor, ring: circle.map(p => ({ x: p.x, y: ROAD_Y, z: p.z })) });
   }
 
   buildingShapes.forEach((b, i) => {
